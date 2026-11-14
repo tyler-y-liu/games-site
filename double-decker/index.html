@@ -477,7 +477,9 @@ const BusAudio = (() => {
     voiceNode = s;
   }
 
-  return { unlock, setMuted, sfx, voice, isMuted: () => muted };
+  function pause(v) { if (ctx) (v ? ctx.suspend() : ctx.resume()); }
+
+  return { unlock, setMuted, sfx, voice, pause, isMuted: () => muted };
 })();
 
 </script>
@@ -1031,14 +1033,239 @@ const BusRender = (() => {
 </script>
 <script>
 'use strict';
+/* 幼儿游戏共用的家长时间控制；模型可在 Node 单测，UI 只在浏览器加载。 */
+(function (root, factory) {
+  const api = factory();
+  if (typeof module === 'object' && module.exports) module.exports = api;
+  if (root) root.KidsTime = api;
+})(typeof window !== 'undefined' ? window : null, function () {
+  const STORAGE_KEY = 'kidsGames.time';
+  const DEFAULT_MINUTES = 15;
+  const OPTIONS = [0, 5, 10, 15, 20, 30];
+
+  function normalize(raw) {
+    try {
+      const v = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      if (!v || v.v !== 1 || !OPTIONS.includes(v.limit)) return null;
+      if (typeof v.remaining !== 'number' || !Number.isFinite(v.remaining) || v.remaining < 0 || v.remaining > 604800) return null;
+      return { limit: v.limit, remaining: v.remaining };
+    } catch (e) { return null; }
+  }
+
+  class Model {
+    constructor(options) {
+      const opts = options || {};
+      this.storage = opts.storage || null;
+      this.now = opts.now || Date.now;
+      let saved = null;
+      try { saved = normalize(this.storage && this.storage.getItem(STORAGE_KEY)); } catch (e) { /* 无痕模式也能玩 */ }
+      this.limit = saved ? saved.limit : DEFAULT_MINUTES;
+      this.remaining = saved ? saved.remaining : DEFAULT_MINUTES * 60;
+      this.lastNow = this.now();
+      this.lastSaved = this.lastNow;
+      this.dirty = false;
+    }
+
+    get expired() { return this.limit > 0 && this.remaining <= 0; }
+    get unlimited() { return this.limit === 0; }
+
+    tick(active) {
+      const now = this.now();
+      const elapsed = Math.max(0, (now - this.lastNow) / 1000);
+      this.lastNow = now;
+      if (active && !this.unlimited && !this.expired && elapsed > 0) {
+        this.remaining = Math.max(0, this.remaining - elapsed);
+        this.dirty = true;
+      }
+      // 切到后台、时间到或每 5 秒落一次盘，刷新 / 换游戏不会平白多出一轮。
+      if (this.dirty && (!active || now - this.lastSaved >= 5000)) this.save();
+      return this.remaining;
+    }
+
+    save() {
+      this.dirty = false;
+      this.lastSaved = this.now();
+      try {
+        if (this.storage) this.storage.setItem(STORAGE_KEY, JSON.stringify({
+          v: 1, limit: this.limit, remaining: Math.round(this.remaining * 1000) / 1000
+        }));
+      } catch (e) { /* 存不了只影响下次打开，当前这轮照常计时 */ }
+    }
+
+    newSession(minutes) {
+      if (!OPTIONS.includes(minutes)) throw new RangeError('Unsupported time limit');
+      this.limit = minutes;
+      this.remaining = minutes * 60;
+      this.lastNow = this.now();
+      this.save();
+    }
+
+    addMinutes(minutes) {
+      if (!Number.isFinite(minutes) || minutes <= 0 || minutes > 60) throw new RangeError('Invalid extra time');
+      if (!this.unlimited) this.remaining = Math.min(604800, this.remaining + minutes * 60);
+      this.lastNow = this.now();
+      this.save();
+    }
+
+    sync(raw) {
+      const v = normalize(raw);
+      if (!v) return;
+      this.limit = v.limit;
+      this.remaining = v.remaining;
+      this.lastNow = this.now();
+      this.dirty = false;
+    }
+  }
+
+  function format(seconds) {
+    const total = Math.max(0, Math.ceil(seconds));
+    return Math.floor(total / 60) + ':' + String(total % 60).padStart(2, '0');
+  }
+
+  const CSS = `
+    .kt-status{position:fixed;z-index:40;top:max(8px,env(safe-area-inset-top));left:50%;transform:translateX(-50%);display:flex;align-items:center;gap:8px;border:2px solid rgba(255,255,255,.85);border-radius:999px;background:rgba(31,39,51,.88);color:#fff;padding:7px 14px;font:700 17px/1.2 -apple-system,BlinkMacSystemFont,"PingFang HK","Noto Sans TC",sans-serif;box-shadow:0 3px 12px rgba(0,0,0,.18);touch-action:none;user-select:none;-webkit-user-select:none;-webkit-tap-highlight-color:transparent}
+    .kt-status small{font-size:12px;font-weight:600;opacity:.8}.kt-status.kt-low{background:#a43b16;animation:kt-pulse 1s ease-in-out infinite}
+    @keyframes kt-pulse{50%{transform:translateX(-50%) scale(1.05)}}
+    .kt-layer{position:fixed;z-index:60;inset:0;display:flex;align-items:center;justify-content:center;padding:20px;background:rgba(22,29,38,.76);font-family:-apple-system,BlinkMacSystemFont,"PingFang HK","Noto Sans TC",sans-serif;color:#273241}
+    .kt-layer[hidden]{display:none}.kt-card{width:min(520px,94vw);max-height:90vh;overflow:auto;box-sizing:border-box;background:#fffdf7;border-radius:24px;padding:24px;text-align:center;box-shadow:0 16px 60px rgba(0,0,0,.28)}
+    .kt-card h1,.kt-card h2{margin:0 0 10px;line-height:1.25}.kt-card p{margin:8px 0 16px;color:#5b6470;line-height:1.55}.kt-done-icon{font-size:54px;line-height:1.2}.kt-remaining{font-size:24px;font-weight:800;color:#164e63}
+    .kt-options{display:flex;flex-wrap:wrap;justify-content:center;gap:8px;border:0;padding:0;margin:14px 0 18px}.kt-options legend{width:100%;margin-bottom:8px;font-weight:700;color:#46505d}.kt-options label{display:block;cursor:pointer}.kt-options input{position:absolute;opacity:0;pointer-events:none}.kt-options span{display:block;padding:9px 13px;border:2px solid #d8dee5;border-radius:12px;background:#fff;font-weight:700}.kt-options input:checked+span{border-color:#087f8c;background:#e3f5f6;color:#075e68}.kt-options input:focus-visible+span{outline:3px solid #f0a51a;outline-offset:2px}
+    .kt-actions{display:flex;flex-wrap:wrap;justify-content:center;gap:10px}.kt-actions button,.kt-parent-open{min-height:44px;border:0;border-radius:12px;padding:10px 18px;background:#66717e;color:#fff;font:700 16px/1.3 -apple-system,BlinkMacSystemFont,"PingFang HK","Noto Sans TC",sans-serif;cursor:pointer;touch-action:manipulation}.kt-actions button.kt-primary{background:#087f8c}.kt-actions button:disabled{opacity:.45}.kt-hold-hint{font-size:13px!important;margin-bottom:0!important}.kt-parent-open{background:#8a4b16;min-width:220px;min-height:52px;touch-action:none;user-select:none;-webkit-user-select:none}
+    @media(max-height:420px){.kt-card{padding:16px}.kt-done-icon{font-size:36px}.kt-card h1,.kt-card h2{font-size:22px}.kt-card p{margin:5px 0 10px}.kt-options{margin:8px 0 12px}.kt-options span{padding:6px 10px}.kt-status{font-size:14px;padding:5px 11px}}
+    @media(prefers-reduced-motion:reduce){.kt-status.kt-low{animation:none}}
+  `;
+
+  function mount(options) {
+    const settings = Object.assign({}, options);
+    // 不在 mount 顶层直接读 localStorage：某些 file:// / 无痕环境的 getter 会抛错。
+    if (!settings.storage) settings.storage = {
+      getItem: k => window.localStorage.getItem(k),
+      setItem: (k, v) => window.localStorage.setItem(k, v)
+    };
+    const model = new Model(settings);
+    const style = document.createElement('style');
+    style.textContent = CSS;
+    document.head.appendChild(style);
+    const root = document.createElement('div');
+    root.id = 'kidsTime';
+    root.innerHTML = `
+      <button class="kt-status" type="button" aria-label="家長時間控制，長按開啟"><span data-role="time"></span><small>家長長按</small></button>
+      <div class="kt-layer kt-done" data-role="done" role="dialog" aria-modal="true" aria-labelledby="ktDoneTitle" hidden>
+        <div class="kt-card"><div class="kt-done-icon" aria-hidden="true">🌙</div><h1 id="ktDoneTitle">時間到，休息吓</h1>
+          <p>呢輪玩完喇，畀對眼休息一下。<br>如果想再玩，請家長加時間。</p>
+          <button class="kt-parent-open" data-role="open" type="button">家長設定（長按）</button>
+          <p class="kt-hold-hint">長按 1.5 秒開啟</p></div>
+      </div>
+      <div class="kt-layer" data-role="panel" role="dialog" aria-modal="true" aria-labelledby="ktPanelTitle" hidden>
+        <div class="kt-card"><h2 id="ktPanelTitle">家長時間控制</h2>
+          <p>三款幼兒遊戲<b>共用呢輪時間</b>。<br>切到背景、旋轉提示或家長面板開著時，時鐘會暫停。</p>
+          <div class="kt-remaining" data-role="remaining"></div>
+          <fieldset class="kt-options"><legend>開始新一輪</legend>
+            ${OPTIONS.map(n => `<label><input type="radio" name="ktLimit" value="${n}"${model.limit === n ? ' checked' : ''}><span>${n ? n + ' 分鐘' : '不限時'}</span></label>`).join('')}
+          </fieldset>
+          <div class="kt-actions"><button type="button" data-role="add">加 5 分鐘</button><button type="button" class="kt-primary" data-role="start">開始新一輪</button><button type="button" data-role="close">關閉</button></div>
+          <p class="kt-hold-hint">「開始新一輪」會重設時間；「加 5 分鐘」會保留目前進度。</p>
+        </div>
+      </div>`;
+    document.body.appendChild(root);
+    const status = root.querySelector('.kt-status');
+    const timeText = root.querySelector('[data-role="time"]');
+    const done = root.querySelector('[data-role="done"]');
+    const panel = root.querySelector('[data-role="panel"]');
+    const remainingText = root.querySelector('[data-role="remaining"]');
+    const addButton = root.querySelector('[data-role="add"]');
+    let dialogOpen = false, lastTimeText = '';
+
+    function render() {
+      const text = model.unlimited ? '不限時' : format(model.remaining);
+      if (text !== lastTimeText) { timeText.textContent = text; lastTimeText = text; }
+      status.classList.toggle('kt-low', !model.unlimited && model.remaining <= 60);
+      status.setAttribute('aria-label', (model.unlimited ? '目前不限時。' : '剩餘 ' + text + '。') + '家長長按開啟時間控制');
+      done.hidden = dialogOpen || !model.expired;
+      panel.hidden = !dialogOpen;
+      remainingText.textContent = model.unlimited ? '目前不限時' : '今輪仲剩 ' + format(model.remaining);
+      addButton.disabled = model.unlimited;
+    }
+
+    function tick(active) {
+      model.tick(!!active && !dialogOpen && !document.hidden && !model.expired);
+      render();
+    }
+
+    function openParent() {
+      model.tick(false);
+      dialogOpen = true;
+      render();
+      root.querySelector('[data-role="close"]').focus();
+    }
+    function closeParent() {
+      dialogOpen = false;
+      model.tick(false);
+      render();
+      (model.expired ? root.querySelector('[data-role="open"]') : status).focus();
+    }
+
+    function holdable(el) {
+      let timer = null;
+      const cancel = () => { if (timer) clearTimeout(timer); timer = null; };
+      el.addEventListener('pointerdown', e => {
+        if (e.button && e.button !== 0) return;
+        e.preventDefault(); e.stopPropagation(); cancel();
+        timer = setTimeout(() => { timer = null; openParent(); }, (options && options.holdMs) || 1500);
+      });
+      ['pointerup', 'pointercancel', 'pointerleave'].forEach(name => el.addEventListener(name, cancel));
+      el.addEventListener('click', e => {
+        e.preventDefault(); e.stopPropagation();
+        if (e.detail === 0) openParent();       // 键盘 Enter / Space 也可打开，不让家长卡在长按手势上
+      });
+      el.addEventListener('contextmenu', e => e.preventDefault());
+    }
+    holdable(status);
+    holdable(root.querySelector('[data-role="open"]'));
+    root.querySelector('[data-role="add"]').addEventListener('click', () => { model.addMinutes(5); closeParent(); });
+    root.querySelector('[data-role="start"]').addEventListener('click', () => {
+      const chosen = root.querySelector('input[name="ktLimit"]:checked');
+      model.newSession(Number(chosen.value)); closeParent();
+    });
+    root.querySelector('[data-role="close"]').addEventListener('click', closeParent);
+    document.addEventListener('keydown', e => {
+      if (!dialogOpen) return;
+      if (e.key === 'Escape') { e.preventDefault(); e.stopImmediatePropagation(); closeParent(); return; }
+      if (e.key !== 'Tab') return;
+      const focusable = Array.from(panel.querySelectorAll('button:not(:disabled), input')).filter(el => el.offsetParent !== null);
+      if (!focusable.length) return;
+      const first = focusable[0], last = focusable[focusable.length - 1];
+      if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+      else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+    }, true);
+    document.addEventListener('visibilitychange', () => { model.tick(false); render(); });
+    window.addEventListener('pagehide', () => model.tick(false));
+    window.addEventListener('pageshow', () => model.tick(false));
+    window.addEventListener('storage', e => { if (e.key === STORAGE_KEY) { model.sync(e.newValue); render(); } });
+    render();
+
+    return {
+      model, tick, openParent, closeParent,
+      get blocked() { return model.expired; },
+      get dialogOpen() { return dialogOpen; }
+    };
+  }
+
+  return { Model, mount, format, normalize, STORAGE_KEY, DEFAULT_MINUTES, OPTIONS };
+});
+
+</script>
+<script>
+'use strict';
 // 外壳：画布缩放、输入、主循环、存储、家长记录。
 (() => {
   const L = Layout;
   const cv = document.getElementById('cv'), c = cv.getContext('2d');
   const panel = document.getElementById('parent');
   const g = BusModel.create(Math.random, ASSETS.words);
+  const clock = KidsTime.mount();
   g.muted = false;
-  let scale = 1, paused = false, last = 0, holdTimer = null;
+  let scale = 1, paused = false, last = 0, holdTimer = null, audioPaused = false;
 
   const store = {
     get(k, d) { try { const v = localStorage.getItem('doubleDecker.' + k); return v ? JSON.parse(v) : d; } catch (e) { return d; } },
@@ -1126,7 +1353,7 @@ const BusRender = (() => {
   cv.addEventListener('pointerdown', e => {
     e.preventDefault();
     BusAudio.unlock();
-    if (paused) return;
+    if (paused || clock.blocked || clock.dialogOpen) return;
     const p = point(e);
     // 家长记录：标题页长按小熊 1.5 秒，小朋友乱点点不出来
     if (g.m.phase === 'title' && inCircle(p, L.bear, 6)) holdTimer = setTimeout(showParent, 1500);
@@ -1137,7 +1364,7 @@ const BusRender = (() => {
   cv.addEventListener('contextmenu', e => e.preventDefault());
 
   window.addEventListener('keydown', e => {
-    if (e.repeat || paused || !panel.hidden) return;
+    if (e.repeat || paused || !panel.hidden || clock.blocked || clock.dialogOpen) return;
     BusAudio.unlock();
     const m = g.m;
     if (e.code === 'Space' || e.code === 'Enter') {
@@ -1155,6 +1382,7 @@ const BusRender = (() => {
 
   const esc = s => String(s).replace(/[&<>]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[ch]);
   function showParent() {
+    if (clock.blocked || clock.dialogOpen) return;
     const names = BusRender.LEVEL_NAME;
     const label = {};
     ASSETS.words.forEach(w => { label[w.id] = w.word; });
@@ -1181,7 +1409,12 @@ const BusRender = (() => {
   function frame(now) {
     const dt = Math.min(0.05, (now - last) / 1000 || 0);
     last = now;
-    if (!paused && !document.hidden && panel.hidden) { g.update(dt); flush(); }
+    const home = ['splash', 'title', 'depot'].includes(g.m.phase);
+    clock.tick(!paused && panel.hidden && !home);
+    const blocked = paused || document.hidden || clock.blocked || clock.dialogOpen;
+    if ((clock.blocked || clock.dialogOpen) && holdTimer) { clearTimeout(holdTimer); holdTimer = null; }
+    if (blocked !== audioPaused) { BusAudio.pause(blocked); audioPaused = blocked; }
+    if (!blocked && panel.hidden) { g.update(dt); flush(); }
     BusRender.draw(c, g);
     requestAnimationFrame(frame);
   }
@@ -1189,6 +1422,7 @@ const BusRender = (() => {
   window.addEventListener('resize', resize);
   resize();
   window.__bus = g;   // 浏览器验收脚本读状态用
+  window.__busTime = clock;
   requestAnimationFrame(frame);
 })();
 
