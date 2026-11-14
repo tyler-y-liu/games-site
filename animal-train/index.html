@@ -1,0 +1,1905 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>动物小火车</title>
+<style>
+html,
+body {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  overscroll-behavior: none;
+  background: #f7edd8;
+}
+
+body {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.stage,
+#stage {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+
+#cv {
+  display: block;
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 0;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+#cv:focus-visible {
+  outline: 3px solid #356a68;
+  outline-offset: -3px;
+}
+
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="cv" role="application" aria-label="动物小火车游戏画布：拼接铁轨，送小动物上车"></canvas></div>
+<script>
+(function () {
+  'use strict';
+
+  function roundRect(ctx, x, y, w, h, r) {
+    var radius = Math.max(0, Math.min(r || 0, Math.abs(w) / 2, Math.abs(h) / 2));
+    ctx.beginPath();
+    ctx.moveTo(x + radius, y);
+    ctx.lineTo(x + w - radius, y);
+    ctx.quadraticCurveTo(x + w, y, x + w, y + radius);
+    ctx.lineTo(x + w, y + h - radius);
+    ctx.quadraticCurveTo(x + w, y + h, x + w - radius, y + h);
+    ctx.lineTo(x + radius, y + h);
+    ctx.quadraticCurveTo(x, y + h, x, y + h - radius);
+    ctx.lineTo(x, y + radius);
+    ctx.quadraticCurveTo(x, y, x + radius, y);
+    ctx.closePath();
+  }
+
+  function railPath(ctx, points, offset) {
+    ctx.beginPath();
+    for (var i = 0; i < points.length; i += 1) {
+      var p = points[i];
+      var x = p.x - Math.sin(p.heading) * offset;
+      var y = p.y + Math.cos(p.heading) * offset;
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  }
+
+  function track(ctx, points, options) {
+    options = options || {};
+    if (!points || points.length === 0) return;
+    var ghost = !!(options.ghost || options.Ghost);
+    var highlight = !!(options.highlight || options.selected);
+    ctx.save();
+    try {
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      if (ghost) ctx.setLineDash([8, 8]);
+
+      if (highlight) {
+        ctx.strokeStyle = '#F6E7A1';
+        ctx.lineWidth = 3;
+        railPath(ctx, points, -11);
+        railPath(ctx, points, 11);
+      }
+
+      if (!ghost) {
+        ctx.strokeStyle = '#8B654D';
+        ctx.lineWidth = 7;
+        ctx.beginPath();
+        for (var i = 0; i < points.length; i += 3) {
+          var p = points[i];
+          var nx = -Math.sin(p.heading);
+          var ny = Math.cos(p.heading);
+          ctx.moveTo(p.x - nx * 10, p.y - ny * 10);
+          ctx.lineTo(p.x + nx * 10, p.y + ny * 10);
+        }
+        ctx.stroke();
+      }
+
+      ctx.strokeStyle = ghost ? '#B8C9B6' : '#667873';
+      ctx.lineWidth = 4;
+      railPath(ctx, points, -7);
+      railPath(ctx, points, 7);
+    } finally {
+      if (ghost) ctx.setLineDash([]);
+      ctx.restore();
+    }
+  }
+
+  function arcGlyph(rect, cx, cy, radius, start, direction) {
+    var points = [];
+    var steps = 28;
+    var w = rect.w == null ? rect.width : rect.w;
+    var h = rect.h == null ? rect.height : rect.h;
+    for (var i = 0; i <= steps; i += 1) {
+      var angle = start + direction * (Math.PI / 2) * (i / steps);
+      points.push({
+        x: rect.x + (cx + Math.cos(angle) * radius) * w,
+        y: rect.y + (cy + Math.sin(angle) * radius) * h,
+        heading: Math.atan2(
+          Math.cos(angle) * direction * h,
+          -Math.sin(angle) * direction * w
+        )
+      });
+    }
+    return points;
+  }
+
+  function pieceGlyph(ctx, shape, rect, options) {
+    options = options || {};
+    var w = rect.w == null ? rect.width : rect.w;
+    var h = rect.h == null ? rect.height : rect.h;
+    var points;
+    if (shape === 'WN') {
+      points = arcGlyph(rect, 0.15, 0.15, 0.35, Math.PI / 2, -1);
+    } else if (shape === 'WS') {
+      points = arcGlyph(rect, 0.15, 0.85, 0.35, -Math.PI / 2, 1);
+    } else {
+      points = [];
+      for (var i = 0; i <= 28; i += 1) {
+        points.push({
+          x: rect.x + (0.15 + 0.7 * (i / 28)) * w,
+          y: rect.y + 0.5 * h,
+          heading: 0
+        });
+      }
+    }
+    var drawOptions = {
+      ghost: !!(options.ghost || options.Ghost),
+      highlight: !!(options.highlight || options.selected)
+    };
+    if (this && typeof this.track === 'function') {
+      this.track(ctx, points, drawOptions);
+    } else if (window.TrainArt && typeof window.TrainArt.track === 'function') {
+      window.TrainArt.track(ctx, points, drawOptions);
+    }
+  }
+
+  window.TrackArt = {
+    roundRect: roundRect,
+    track: track,
+    pieceGlyph: pieceGlyph
+  };
+}());
+
+</script>
+<script>
+(function () {
+  'use strict';
+  const INK = '#244A46';
+  const PAPER = '#FFF9EC';
+
+  function rr(ctx, x, y, w, h, r) {
+    const q = Math.min(r, w / 2, h / 2);
+    ctx.beginPath();
+    ctx.moveTo(x + q, y); ctx.lineTo(x + w - q, y); ctx.quadraticCurveTo(x + w, y, x + w, y + q);
+    ctx.lineTo(x + w, y + h - q); ctx.quadraticCurveTo(x + w, y + h, x + w - q, y + h);
+    ctx.lineTo(x + q, y + h); ctx.quadraticCurveTo(x, y + h, x, y + h - q);
+    ctx.lineTo(x, y + q); ctx.quadraticCurveTo(x, y, x + q, y); ctx.closePath();
+  }
+
+  function dot(ctx, x, y, r, color, outlined) {
+    ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fillStyle = color; ctx.fill();
+    if (outlined) { ctx.strokeStyle = INK; ctx.stroke(); }
+  }
+
+  function cloud(ctx, x, y, scale) {
+    ctx.save(); ctx.translate(x, y); ctx.scale(scale, scale);
+    ctx.beginPath(); ctx.moveTo(-36, 13); ctx.bezierCurveTo(-47, 2, -34, -10, -22, -7);
+    ctx.bezierCurveTo(-20, -27, 9, -29, 15, -10); ctx.bezierCurveTo(35, -17, 47, 1, 36, 13); ctx.closePath();
+    ctx.fillStyle = PAPER; ctx.fill(); ctx.restore();
+  }
+
+  function tree(ctx, x, y, scale, leaf) {
+    ctx.save(); ctx.translate(x, y); ctx.scale(scale, scale); ctx.lineWidth = 3;
+    rr(ctx, -5, -25, 10, 29, 4); ctx.fillStyle = '#A87955'; ctx.fill(); ctx.strokeStyle = INK; ctx.stroke();
+    dot(ctx, -14, -35, 21, leaf, true);
+    dot(ctx, 13, -38, 23, leaf, true);
+    dot(ctx, 0, -56, 25, leaf, true);
+    dot(ctx, -8, -62, 6, '#CBEA9B'); ctx.restore();
+  }
+
+  function flower(ctx, x, y, color) {
+    ctx.strokeStyle = '#397B62'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(x, y + 3); ctx.lineTo(x - 1, y + 14); ctx.stroke();
+    for (let i = 0; i < 4; i += 1) {
+      const a = i * Math.PI / 2;
+      dot(ctx, x + Math.cos(a) * 4, y + Math.sin(a) * 4, 3.5, color);
+    }
+    dot(ctx, x, y, 2.5, '#FFD76A');
+  }
+
+  function background(ctx, level, time, reducedMotion) {
+    ctx.save();
+    const scene = Math.max(1, Math.min(3, (Math.round(level) || 0) + 1));
+    const t = reducedMotion ? 0 : (time || 0) / 1000; const shift = (scene - 2) * 13;
+    ctx.fillStyle = '#DDF3F2'; ctx.fillRect(0, 0, 960, 472);
+    dot(ctx, 830 - scene * 13, 70, 32, '#FFE6A0');
+    cloud(ctx, 320 + Math.sin(t * 0.18) * 6, 84, 1.05);
+    cloud(ctx, 560 + Math.sin(t * 0.14 + 2) * 5, 120, 0.75);
+    cloud(ctx, 664 + Math.sin(t * 0.16 + 4) * 6, 176 + scene * 8, 0.9);
+    ctx.fillStyle = '#A9D685';
+    ctx.beginPath(); ctx.moveTo(0, 275);
+    ctx.bezierCurveTo(135, 205 + shift, 265, 297, 405, 241);
+    ctx.bezierCurveTo(580, 176 - shift, 760, 283, 960, 215 + shift); ctx.lineTo(960, 472); ctx.lineTo(0, 472); ctx.fill();
+    ctx.fillStyle = '#6FB276';
+    ctx.beginPath(); ctx.moveTo(0, 330);
+    ctx.bezierCurveTo(160, 270 - shift, 285, 350, 450, 301);
+    ctx.bezierCurveTo(635, 250 + shift, 790, 346, 960, 283); ctx.lineTo(960, 472); ctx.lineTo(0, 472); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(360, 438, 105, 34, 0, 0, Math.PI * 2);
+    ctx.fillStyle = '#79C6D0'; ctx.fill();
+    ctx.beginPath(); ctx.ellipse(360, 438, 91, 25, 0, 0, Math.PI * 2);
+    ctx.strokeStyle = '#C8EEE5'; ctx.lineWidth = 3; ctx.stroke();
+    dot(ctx, 320, 432, 11, '#8FD3B5'); ctx.strokeStyle = '#C8EEE5'; ctx.stroke();
+    dot(ctx, 392, 444, 8, '#8FD3B5'); ctx.stroke();
+    const leaves = ['#76BA78', '#69B985', '#83BC70'];
+    tree(ctx, 74, 270, 0.88, leaves[scene - 1]);
+    tree(ctx, 139, 251, 0.65, leaves[3 - scene]);
+    tree(ctx, 862, 259, 0.94, leaves[scene - 1]);
+    tree(ctx, 806, 242, 0.6, leaves[3 - scene]);
+    dot(ctx, 36, 288, 15, '#599E6A'); dot(ctx, 52, 290, 12, '#74B776');
+    dot(ctx, 909, 285, 15, '#599E6A'); dot(ctx, 892, 290, 11, '#83C181');
+    const petals = ['#F2765B', '#F5C75D', '#ED94AA'];
+    flower(ctx, 96, 294, petals[scene - 1]); flower(ctx, 117, 306, '#FFF0C2');
+    flower(ctx, 838, 303, petals[3 - scene]); flower(ctx, 880, 311, '#FFF0C2');
+    flower(ctx, 913, 300, petals[scene - 1]); ctx.restore();
+  }
+
+  function station(ctx, x, y, heading, kind, time) {
+    ctx.save(); ctx.translate(x, y); ctx.rotate(heading || 0); ctx.lineJoin = 'round'; ctx.lineCap = 'round'; ctx.lineWidth = 3;
+    if (kind === 'start') {
+      rr(ctx, -38, -60, 70, 52, 7); ctx.fillStyle = '#FFF1CF'; ctx.fill(); ctx.strokeStyle = INK; ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(-48, -56); ctx.lineTo(-10, -87); ctx.lineTo(43, -56); ctx.closePath();
+      ctx.fillStyle = '#F2765B'; ctx.fill(); ctx.stroke();
+      rr(ctx, -29, -77, 12, 21, 3); ctx.fillStyle = '#FFF1CF'; ctx.fill(); ctx.stroke();
+      rr(ctx, -2, -39, 19, 31, 5); ctx.fillStyle = '#64AFA0'; ctx.fill(); ctx.stroke();
+      dot(ctx, 11, -24, 2, '#FFE080');
+      rr(ctx, -29, -47, 18, 17, 5); ctx.fillStyle = '#FFD86A'; ctx.fill(); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(-20, -46); ctx.lineTo(-20, -31); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(-8, -6); ctx.lineTo(23, -6); ctx.stroke();
+    } else {
+      ctx.beginPath(); ctx.moveTo(0, -7); ctx.lineTo(0, -91); ctx.strokeStyle = INK; ctx.lineWidth = 6; ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(0, -7); ctx.lineTo(0, -91); ctx.strokeStyle = '#F8E7BF'; ctx.lineWidth = 2; ctx.stroke();
+      dot(ctx, 0, -94, 5, '#FFD66B', true);
+      const wave = Math.sin((time || 0) / 1000 * 3) * 2;
+      ctx.beginPath(); ctx.moveTo(3, -86); ctx.quadraticCurveTo(25, -94 + wave, 45, -82);
+      ctx.lineTo(39, -65); ctx.quadraticCurveTo(22, -76 + wave, 3, -69); ctx.closePath();
+      ctx.fillStyle = '#F2765B'; ctx.fill(); ctx.strokeStyle = INK; ctx.lineWidth = 3; ctx.stroke();
+      rr(ctx, -14, -9, 28, 8, 4); ctx.fillStyle = '#FFF1CF'; ctx.fill(); ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  function wheel(ctx, x, y, r) {
+    dot(ctx, x, y, r, INK); dot(ctx, x, y, r * 0.53, '#C9E3D5'); dot(ctx, x, y, r * 0.19, '#FFF4D6');
+  }
+
+  function train(ctx, cars, time, options = {}) {
+    ctx.save(); options = options || {};
+    if (!cars || !cars.length) { ctx.restore(); return; }
+    for (let i = cars.length - 1; i >= 0; i -= 1) {
+      const car = cars[i];
+      ctx.save(); ctx.translate(car.x, car.y); ctx.rotate(car.heading || 0); ctx.lineJoin = 'round'; ctx.lineCap = 'round'; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.moveTo(-48, 7); ctx.lineTo(-36, 7); ctx.strokeStyle = INK; ctx.lineWidth = 4; ctx.stroke();
+      if (i === 0) {
+        rr(ctx, -40, -4, 82, 19, 6); ctx.fillStyle = '#F2765B'; ctx.fill(); ctx.strokeStyle = INK; ctx.lineWidth = 3; ctx.stroke();
+        rr(ctx, -36, -43, 35, 41, 7); ctx.fillStyle = '#315575'; ctx.fill(); ctx.stroke();
+        rr(ctx, -29, -35, 19, 17, 4); ctx.fillStyle = '#FFD86A'; ctx.fill(); ctx.stroke();
+        rr(ctx, -43, -49, 48, 9, 4); ctx.fillStyle = '#F2765B'; ctx.fill(); ctx.stroke();
+        rr(ctx, -5, -24, 46, 23, 10); ctx.fillStyle = '#F2765B'; ctx.fill(); ctx.stroke();
+        rr(ctx, 16, -42, 13, 23, 3); ctx.fillStyle = '#315575'; ctx.fill(); ctx.stroke();
+        rr(ctx, 12, -46, 21, 7, 3); ctx.fillStyle = '#F2765B'; ctx.fill(); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(39, 5); ctx.lineTo(49, 14); ctx.lineTo(31, 14); ctx.closePath(); ctx.fillStyle = '#F2765B'; ctx.fill(); ctx.stroke();
+        dot(ctx, 38, -13, 5, '#FFE080', true);
+        wheel(ctx, -25, 17, 10); wheel(ctx, 1, 17, 10); wheel(ctx, 28, 17, 10);
+        if (options.horn) {
+          for (let p = 0; p < 3; p += 1) {
+            const drift = options.reducedMotion ? 0 : Math.sin((time || 0) / 1000 * 4 + p) * 2;
+            dot(ctx, 23 + p * 7 + drift, -58 - p * 13, 6 + p * 2, PAPER, true);
+          }
+        }
+      } else {
+        rr(ctx, -39, -34, 76, 42, 9); ctx.fillStyle = '#58B7A4'; ctx.fill(); ctx.strokeStyle = INK; ctx.lineWidth = 3; ctx.stroke();
+        rr(ctx, -43, -40, 84, 10, 5); ctx.fillStyle = '#8FD3B5'; ctx.fill(); ctx.stroke();
+        rr(ctx, -28, -25, 20, 17, 5); ctx.fillStyle = '#FFE080'; ctx.fill(); ctx.stroke();
+        rr(ctx, 6, -25, 20, 17, 5); ctx.fillStyle = '#FFE080'; ctx.fill(); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(-34, 1); ctx.lineTo(32, 1); ctx.stroke();
+        wheel(ctx, -24, 17, 10); wheel(ctx, 23, 17, 10);
+      }
+      ctx.restore();
+    }
+    ctx.restore();
+  }
+
+  window.SceneArt = { background, station, train };
+}());
+
+</script>
+<script>
+(function () {
+  'use strict';
+
+  const INK = '#244A46';
+
+  function animal(ctx, kind, x, y, scale = 1, pose = {}) {
+    if (typeof pose === 'string') pose = { mode: pose };
+    const mode = pose.mode || 'idle';
+    const fur = { rabbit: '#FFF7E9', dog: '#D6A253', cat: '#F2A33C', bear: '#986747', squirrel: '#C87842', fox: '#ED8238' }[kind] || '#D6A253';
+    const hop = pose.jump ? 12 : mode === 'celebrate' ? 6 : 0;
+    const wave = pose.wave || mode === 'celebrate';
+    ctx.save();
+    ctx.translate(x, y - hop * scale);
+    ctx.scale(scale, scale);
+    ctx.globalAlpha *= pose.alpha == null ? 1 : pose.alpha;
+    ctx.lineWidth = 2;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.strokeStyle = INK;
+    function oval(px, py, rx, ry, color, angle = 0) {
+      ctx.beginPath();
+      ctx.ellipse(px, py, rx, ry, angle, 0, Math.PI * 2);
+      ctx.fillStyle = color;
+      ctx.fill();
+      ctx.stroke();
+    }
+    function shape(color) {
+      ctx.fillStyle = color;
+      ctx.fill();
+      ctx.stroke();
+    }
+    switch (kind) {
+      case 'rabbit':
+        oval(-6.5, -43, 4.2, 11, fur, -0.16);
+        oval(6.5, -43, 4.2, 11, fur, 0.16);
+        oval(-6.5, -43, 1.5, 7, '#EDBDB4', -0.16);
+        oval(6.5, -43, 1.5, 7, '#EDBDB4', 0.16);
+        break;
+      case 'dog':
+        ctx.beginPath();
+        ctx.moveTo(-11, -35); ctx.quadraticCurveTo(-21, -34, -16, -20);
+        ctx.quadraticCurveTo(-10, -17, -8, -30); shape('#A9723B');
+        ctx.beginPath();
+        ctx.moveTo(11, -35); ctx.quadraticCurveTo(21, -34, 16, -20);
+        ctx.quadraticCurveTo(10, -17, 8, -30); shape('#A9723B');
+        break;
+      case 'cat':
+      case 'fox':
+        ctx.beginPath();
+        ctx.moveTo(-12, -32); ctx.lineTo(-11, -45); ctx.lineTo(-3, -37);
+        ctx.lineTo(3, -37); ctx.lineTo(11, -45); ctx.lineTo(12, -32); shape(fur);
+        break;
+      case 'bear':
+        oval(-10, -36, 5.5, 5.5, fur);
+        oval(10, -36, 5.5, 5.5, fur);
+        break;
+      case 'squirrel':
+        ctx.beginPath();
+        ctx.moveTo(-7, -8); ctx.bezierCurveTo(-31, -2, -34, -31, -19, -34);
+        ctx.bezierCurveTo(-7, -37, -10, -21, -18, -21);
+        ctx.bezierCurveTo(-25, -19, -21, -9, -7, -8); shape('#B96839');
+        oval(-9, -36, 4, 5, fur, -0.3);
+        oval(9, -36, 4, 5, fur, 0.3);
+        break;
+    }
+    if (kind === 'fox') {
+      ctx.beginPath();
+      ctx.moveTo(7, -10); ctx.bezierCurveTo(31, -3, 34, -23, 18, -27);
+      ctx.bezierCurveTo(25, -16, 13, -20, 7, -10); shape(fur);
+      ctx.beginPath();
+      ctx.moveTo(18, -27); ctx.quadraticCurveTo(29, -25, 28, -17);
+      ctx.quadraticCurveTo(24, -20, 20, -17); ctx.quadraticCurveTo(23, -23, 18, -27);
+      ctx.fillStyle = '#FFF7E9'; ctx.fill();
+    }
+    oval(0, -13, mode === 'riding' ? 11 : 10, 13, fur);
+    oval(-6, -2, 5, 3, fur);
+    oval(6, -2, 5, 3, fur);
+    ctx.beginPath();
+    if (wave) {
+      ctx.moveTo(7, -19); ctx.quadraticCurveTo(17, -23, 15, -34);
+      ctx.moveTo(15, -34); ctx.lineTo(12, -38); ctx.moveTo(15, -34); ctx.lineTo(19, -37);
+    } else if (mode === 'riding' || mode === 'boarding') {
+      ctx.moveTo(-8, -17); ctx.lineTo(-15, -13); ctx.moveTo(8, -17); ctx.lineTo(15, -13);
+    } else {
+      ctx.moveTo(-8, -17); ctx.lineTo(-12, -10); ctx.moveTo(8, -17); ctx.lineTo(12, -10);
+    }
+    ctx.stroke();
+    oval(0, -28, 14, 12, fur);
+    if (kind === 'fox') {
+      ctx.beginPath();
+      ctx.ellipse(-5, -25, 6, 5, -0.2, 0, Math.PI * 2);
+      ctx.ellipse(5, -25, 6, 5, 0.2, 0, Math.PI * 2);
+      ctx.fillStyle = '#FFF7E9'; ctx.fill();
+    }
+    if (kind === 'cat') {
+      ctx.beginPath();
+      ctx.moveTo(-10, -25); ctx.lineTo(-18, -27); ctx.moveTo(-10, -22); ctx.lineTo(-18, -21);
+      ctx.moveTo(10, -25); ctx.lineTo(18, -27); ctx.moveTo(10, -22); ctx.lineTo(18, -21);
+      ctx.lineWidth = 1.4; ctx.stroke(); ctx.lineWidth = 2;
+    }
+    ctx.fillStyle = '#172E2B';
+    ctx.beginPath(); ctx.ellipse(-5, -29, 1.5, 2, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(5, -29, 1.5, 2, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(0, -24.5, 2, 1.6, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(0, -23); ctx.quadraticCurveTo(-2, -19.5, -5, -21.5);
+    ctx.moveTo(0, -23); ctx.quadraticCurveTo(2, -19.5, 5, -21.5);
+    ctx.lineWidth = 1.5; ctx.stroke();
+    ctx.restore();
+  }
+
+  function icon(ctx, type, cx, cy, size, options = {}) {
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.scale(size / 24, size / 24);
+    ctx.strokeStyle = options.color || INK;
+    ctx.fillStyle = options.color || INK;
+    ctx.lineWidth = 2.4;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.globalAlpha *= options.alpha == null ? 1 : options.alpha;
+    ctx.beginPath();
+    // 大三角箭头：tip 为箭尖，dx/dy 需为单位向量方向
+    function arrowHead(tipX, tipY, dx, dy) {
+      const len = 9.2;
+      const half = 4.6;
+      const nx = -dy;
+      const ny = dx;
+      ctx.beginPath();
+      ctx.moveTo(tipX, tipY);
+      ctx.lineTo(tipX - dx * len + nx * half, tipY - dy * len + ny * half);
+      ctx.lineTo(tipX - dx * len - nx * half, tipY - dy * len - ny * half);
+      ctx.closePath();
+      ctx.fill();
+    }
+    if (type === 'horn') {
+      // 火车喇叭/扩音器：宽口锥形朝右 + 左下握把，实心珊瑚色、粗深色描边
+      ctx.strokeStyle = INK;
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(-12, -3.5); ctx.lineTo(-4, -3.5); ctx.lineTo(7, -9.5);
+      ctx.lineTo(7, 9.5); ctx.lineTo(-4, 3.5); ctx.lineTo(-12, 3.5); ctx.closePath();
+      ctx.fillStyle = '#F2765B'; ctx.fill(); ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(-9, 3.5); ctx.lineTo(-9, 10); ctx.lineTo(-4.5, 10); ctx.lineTo(-4.5, 3.5);
+      ctx.fillStyle = '#F2765B'; ctx.fill(); ctx.stroke();
+      // 右前方 2 道短声弧，深色细线
+      ctx.beginPath();
+      ctx.lineWidth = 2;
+      ctx.moveTo(10.5, -6.2); ctx.quadraticCurveTo(13.6, 0, 10.5, 6.2);
+      ctx.moveTo(13.6, -9.2); ctx.quadraticCurveTo(17.4, 0, 13.6, 9.2);
+      ctx.stroke();
+    } else if (type === 'mute') {
+      // 深色 #244A46 扬声器箱体：矩形箱 + 锥形盆，与珊瑚色喇叭一眼可分
+      ctx.strokeStyle = INK;
+      ctx.lineWidth = 2.4;
+      ctx.beginPath();
+      ctx.rect(-11, -6, 7, 12);
+      ctx.moveTo(-4, -4); ctx.lineTo(4, -10); ctx.lineTo(4, 10); ctx.lineTo(-4, 4); ctx.closePath();
+      ctx.fillStyle = INK; ctx.fill(); ctx.stroke();
+      if (options.muted === true) {
+        // 同一形状上只加一道斜杠（白色断层保证深色箱体上看得见），整体略淡
+        ctx.globalAlpha *= 0.82;
+        ctx.lineWidth = 7; ctx.strokeStyle = '#FFFFFF';
+        ctx.beginPath(); ctx.moveTo(-13, -13); ctx.lineTo(13, 13); ctx.stroke();
+        ctx.lineWidth = 3.2; ctx.strokeStyle = INK;
+        ctx.beginPath(); ctx.moveTo(-13, -13); ctx.lineTo(13, 13); ctx.stroke();
+      } else {
+        // 右侧两道声波
+        ctx.lineWidth = 2.4; ctx.strokeStyle = INK;
+        ctx.beginPath();
+        ctx.arc(3, 0, 5, -0.8, 0.8, false);
+        ctx.moveTo(3 + 9 * Math.cos(-0.62), 9 * Math.sin(-0.62));
+        ctx.arc(3, 0, 9, -0.62, 0.62, false);
+        ctx.stroke();
+      }
+    } else if (type === 'undo' || type === 'replay') {
+      // 两者互为镜像：undo 逆时针 252°、箭头落在左端指向下左；replay 顺时针、箭头落在右端指向下右
+      const isUndo = type === 'undo';
+      const span = Math.PI * 1.4;
+      const from = Math.PI * 0.5;
+      const to = isUndo ? from - span : from + span;
+      ctx.strokeStyle = INK;
+      ctx.lineWidth = 2.4;
+      ctx.beginPath();
+      ctx.arc(0, 0, 9, from, to, isUndo);
+      ctx.stroke();
+      ctx.fillStyle = INK;
+      const ex = 9 * Math.cos(to), ey = 9 * Math.sin(to);
+      if (isUndo) arrowHead(ex, ey, Math.sin(to), -Math.cos(to));
+      else arrowHead(ex, ey, -Math.sin(to), Math.cos(to));
+    } else if (type === 'next') {
+      ctx.moveTo(-9, 0); ctx.lineTo(8, 0); ctx.moveTo(2, -7); ctx.lineTo(9, 0); ctx.lineTo(2, 7);
+      ctx.lineWidth = 3.2; ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  function leaf(ctx, x, y, color, angle) {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(angle || 0);
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.fillStyle = color || '#72A85B';
+    ctx.strokeStyle = INK;
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    ctx.moveTo(-7, 0); ctx.quadraticCurveTo(-2, -8, 8, -5);
+    ctx.quadraticCurveTo(7, 5, -7, 0); ctx.fill(); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(-8, 1); ctx.quadraticCurveTo(0, 0, 6, -4); ctx.stroke();
+    ctx.restore();
+  }
+
+  window.CharacterArt = { animal, icon, leaf };
+}());
+
+</script>
+<script>
+(function () {
+  'use strict';
+
+  var art = {};
+  [window.TrackArt || {}, window.SceneArt || {}, window.CharacterArt || {}].forEach(function (module) {
+    Object.keys(module).forEach(function (key) {
+      art[key] = module[key];
+    });
+  });
+  window.TrainArt = art;
+}());
+
+</script>
+<script>
+(function () {
+  'use strict';
+  var Art = window.TrainArt;
+  var TAU = Math.PI * 2;
+  function num(value, fallback) { return Number.isFinite(value) ? value : fallback; }
+
+  class TrainRenderer {
+    constructor(canvas, model) {
+      this.canvas = canvas;
+      this.ctx = canvas.getContext('2d');
+      this.model = model;
+      this.drag = null;
+      this.portrait = false;
+      this.lastHorn = 0;
+      this.reduced = false;
+      try {
+        this.reduced = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+      } catch (_) { this.reduced = false; }
+    }
+
+    render(time) {
+      var ctx = this.ctx, state = this.model.getState(), geometry = this.model.getGeometry();
+      if (!ctx || !state || !geometry) return;
+      time = num(time, 0);
+      var placements = state.placements || {}, level = num(state.level, 0);
+      var phase = state.phase || '', points = Array.isArray(geometry.points) ? geometry.points : [];
+      ctx.save();
+      ctx.clearRect(0, 0, 960, 600);
+      ctx.fillStyle = '#FFF8E8';
+      ctx.fillRect(0, 0, 960, 600);
+      Art.background(ctx, level, time, this.reduced);
+      if (points.length > 1) {
+        var first = points[0], last = points[points.length - 1];
+        Art.station(ctx, first.x + 34, first.y - 76, num(first.heading, 0), 'start', time);
+        Art.station(ctx, Math.min(950, last.x + 40), last.y, num(last.heading, Math.PI), 'end', time);
+      }
+      (geometry.segments || []).forEach(function (segment) {
+        var filled = !segment.requires || !!placements[segment.requires];
+        Art.track(ctx, segment.points || [], { ghost: !filled, highlight: filled });
+      });
+      var cars = state.train && Array.isArray(state.train.cars) ? state.train.cars : [];
+      var tailCars = cars.slice(1), boardedIndex = 0;
+      var animals = Array.isArray(state.animals) ? state.animals : [];
+      var finish = points.length ? points[points.length - 1] : (cars[0] || { x: 0, y: 0 });
+      var self = this;
+      function drawAnimals() {
+      animals.forEach(function (animal, animalIndex) {
+        if (!animal) return;
+        if (animal.boarded && (phase === 'running' || phase === 'boarding')) {
+          if (tailCars.length) {
+            var car = tailCars[boardedIndex % tailCars.length];
+            var row = Math.floor(boardedIndex / tailCars.length);
+            var offset = row ? (row % 2 ? -1 : 1) * Math.ceil(row / 2) * 14 : 0;
+            Art.animal(ctx, animal.kind, num(car.x, 0) + offset, num(car.y, 0) - 58 - row * 3, 0.55, 'riding');
+          }
+          boardedIndex += 1;
+          return;
+        }
+        var point = this.model.pointAt(num(animal.stopS, 0)) || { x: 0, y: 0 };
+        var x = num(point.x, 0), y = num(point.y, 0) - 45;
+        var boarding = phase === 'boarding' && state.boardingAnimalId === animal.id;
+        var pose = boarding ? 'boarding' : 'idle';
+        if (phase === 'celebrate') {
+          pose = 'celebrate';
+          var baseX = num(finish.x, 0) - 150 + animalIndex * 62;
+          if (baseX < 40) baseX = num(finish.x, 0) - 60 + animalIndex * 62;
+          x = baseX;
+          y = num(finish.y, 0) + 80;
+          if (!this.reduced) y -= Math.abs(Math.sin(time / 180 + num(animal.stopS, 0))) * 12;
+        } else if (boarding) {
+          var head = cars[0] || state.train || point;
+          var headX = num(head.x, x), headY = num(head.y, y + 55) - 55;
+          x += (headX - x) * 0.55;
+          y += (headY - y) * 0.55;
+        }
+        Art.animal(ctx, animal.kind, x, y, 1, pose);
+      }, self);
+      }
+      // 庆祝时动物站到草地上，必须画在火车之后，否则会被车轮和车厢压住
+      if (phase !== 'celebrate') drawAnimals();
+      if (state.hornPulse && state.hornPulse !== this.lastHorn) this.lastHorn = time;
+      Art.train(ctx, (state.train && state.train.cars) || [], time, {
+        horn: time - this.lastHorn < 650, reducedMotion: this.reduced
+      });
+      if (phase === 'celebrate') drawAnimals();
+      if (phase === 'celebrate') this.leaves(time);
+      this.tray(state, geometry);
+      this.controls(state, geometry, level);
+      if (phase === 'build' && num(state.idleMs, 0) >= 5000) this.hint(state, geometry, time);
+      if (this.portrait) this.rotateDevice(ctx, time);
+      ctx.restore();
+    }
+
+    leaves(time) {
+      var ctx = this.ctx;
+      ctx.save();
+      for (var i = 0; i < 20; i += 1) {
+        var seed = time / 700 + i;
+        var x = ((seed * 137 + i * 53) % 1040) - 40;
+        var y = ((seed * 83 + i * 31) % 500) - 20;
+        Art.leaf(ctx, x, y, ['#F39A72', '#F6C85F', '#76B852', '#E97777'][i % 4], this.reduced ? i : seed);
+      }
+      ctx.restore();
+    }
+
+    tray(state, geometry) {
+      var ctx = this.ctx, tray = Array.isArray(state.tray) ? state.tray : [], ids = {};
+      tray.forEach(function (piece) { if (piece && piece.id !== undefined) ids[piece.id] = true; });
+      ctx.save();
+      ctx.fillStyle = '#FFF8E8';
+      ctx.fillRect(0, 472, 960, 128);
+      ctx.strokeStyle = '#83B95B';
+      ctx.lineWidth = 5;
+      ctx.beginPath(); ctx.moveTo(0, 474); ctx.lineTo(960, 474); ctx.stroke();
+      (geometry.pieces || []).forEach(function (piece) {
+        if (!piece || !ids[piece.id] || !piece.card) return;
+        var card = piece.card, x = num(card.x, 0), y = num(card.y, 0);
+        var selected = state.selectedPiece === piece.id;
+        ctx.save();
+        ctx.shadowColor = selected ? '#FFD45C' : 'rgba(74,65,48,0.14)';
+        ctx.shadowBlur = selected ? 20 : 7;
+        ctx.fillStyle = '#FFFFFF';
+        Art.roundRect(ctx, x, y, 200, 108, 18);
+        ctx.fill();
+        if (selected) {
+          ctx.strokeStyle = '#F4B942'; ctx.lineWidth = 4;
+          Art.roundRect(ctx, x, y, 200, 108, 18); ctx.stroke();
+        }
+        Art.pieceGlyph(ctx, piece.shape, { x: x, y: y, w: 200, h: 108 }, { selected: selected, ghost: false });
+        ctx.restore();
+      });
+      if (this.drag && Number.isFinite(this.drag.x) && Number.isFinite(this.drag.y)) {
+        var drag = this.drag;
+        var dragPiece = (geometry.pieces || []).find(function (piece) {
+          return piece && piece.id === drag.pieceId;
+        });
+        if (dragPiece) {
+          Art.pieceGlyph(ctx, dragPiece.shape, { x: drag.x - 75, y: drag.y - 35, w: 150, h: 70 },
+            { selected: true, ghost: false });
+        }
+      }
+      ctx.restore();
+    }
+
+    controls(state, geometry, level) {
+      var ctx = this.ctx;
+      ctx.save();
+      for (var i = 0; i < 3; i += 1) {
+        var x = 56 + i * 56, current = i === level;
+        var done = i < level || (current && state.phase === 'celebrate');
+        ctx.beginPath(); ctx.arc(x, 58, 20, 0, TAU);
+        ctx.fillStyle = done ? '#F28C7B' : '#FFFFFF'; ctx.fill();
+        ctx.strokeStyle = current ? '#4D8B57' : '#D8CDAF';
+        ctx.lineWidth = current ? 4 : 2; ctx.stroke();
+        if (done) {
+          ctx.beginPath(); ctx.moveTo(x - 9, 58); ctx.lineTo(x - 2, 65); ctx.lineTo(x + 11, 49);
+          ctx.strokeStyle = '#FFFFFF'; ctx.lineWidth = 4; ctx.lineCap = 'round'; ctx.lineJoin = 'round'; ctx.stroke();
+        }
+      }
+      (this.model.getHitTargets() || []).forEach(function (target) {
+        if (!target || target.type === 'piece' || target.type === 'gap' || !target.rect) return;
+        var r = target.rect;
+        ctx.save();
+        ctx.fillStyle = target.type === 'next' ? '#78B95A' : '#FFFFFF';
+        Art.roundRect(ctx, r.x, r.y, r.w, r.h, Math.min(18, r.h / 2)); ctx.fill();
+        if (target.type === 'level') this.levelThumbnail(r, target.id);
+        else Art.icon(ctx, target.type, r.x + r.w / 2, r.y + r.h / 2, Math.min(r.w, r.h) * 0.5,
+          { muted: !!state.muted, disabled: !!target.disabled });
+        ctx.restore();
+      }, this);
+      ctx.restore();
+    }
+
+    levelThumbnail(r, level) {
+      var ctx = this.ctx;
+      var scene = Math.max(0, Math.min(2, Math.round(num(Number(level), 0))));
+      ctx.save();
+      Art.roundRect(ctx, r.x + 3, r.y + 3, r.w - 6, r.h - 6, 12); ctx.clip();
+      ctx.fillStyle = ['#A9DCF2', '#C9E5BD', '#C7C4EA'][scene]; ctx.fillRect(r.x, r.y, r.w, r.h);
+      ctx.fillStyle = ['#72AD72', '#89BE63', '#7FA36B'][scene];
+      ctx.fillRect(r.x, r.y + r.h * 0.65, r.w, r.h * 0.35);
+      ctx.fillStyle = ['#75A596', '#8C9D67', '#777FA4'][scene]; ctx.beginPath();
+      ctx.moveTo(r.x + r.w * 0.05, r.y + r.h * 0.68);
+      ctx.lineTo(r.x + r.w * [0.34, 0.5, 0.27][scene], r.y + r.h * [0.23, 0.34, 0.15][scene]);
+      ctx.lineTo(r.x + r.w * 0.62, r.y + r.h * 0.68); ctx.fill();
+      ctx.fillStyle = '#795F43'; ctx.fillRect(r.x + r.w * 0.72, r.y + r.h * 0.51, 3, r.h * 0.25);
+      ctx.fillStyle = ['#397D54', '#56873F', '#59669B'][scene]; ctx.beginPath();
+      ctx.arc(r.x + r.w * 0.72 + 1, r.y + r.h * 0.46, r.h * 0.16, 0, TAU); ctx.fill();
+      ctx.restore();
+    }
+
+    hint(state, geometry, time) {
+      var tray = Array.isArray(state.tray) ? state.tray : [], first = tray[0];
+      if (!first) return;
+      var piece = (geometry.pieces || []).find(function (item) { return item && item.id === first.id; });
+      var gap = (geometry.gaps || []).find(function (item) {
+        return item && item.shape === first.shape && !state.placements[item.id];
+      });
+      if (!piece || !piece.card || !gap || !gap.center) return;
+      var ctx = this.ctx, card = piece.card;
+      var from = { x: card.x + card.w / 2, y: card.y + card.h / 2 };
+      var progress = this.reduced ? 0.6 : (Math.sin(time / 650) + 1) / 2;
+      var pulse = this.reduced ? 1 : 0.75 + Math.sin(time / 320) * 0.25;
+      var x = from.x + (gap.center.x - from.x) * progress;
+      var y = from.y + (gap.center.y - from.y) * progress;
+      ctx.save();
+      // 1. 卡片与目标缺口同步发光，孩子不需要读字也能看出「这块要放那里」
+      ctx.strokeStyle = '#F6C94C';
+      ctx.lineWidth = 7;
+      ctx.globalAlpha = 0.55 + 0.45 * pulse;
+      Art.roundRect(ctx, card.x - 4, card.y - 4, card.w + 8, card.h + 8, 22);
+      ctx.stroke();
+      var gapR = 54 + (this.reduced ? 0 : 8 * pulse);
+      ctx.beginPath();
+      ctx.arc(gap.center.x, gap.center.y, gapR, 0, TAU);
+      ctx.lineWidth = 6;
+      ctx.setLineDash([14, 10]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      // 2. 虚线路径：从卡片指向缺口
+      ctx.globalAlpha = 0.45;
+      ctx.strokeStyle = '#E6A65D';
+      ctx.lineWidth = 4;
+      ctx.setLineDash([10, 12]);
+      ctx.beginPath();
+      ctx.moveTo(from.x, from.y + 30);
+      ctx.lineTo(gap.center.x, gap.center.y + 34);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      // 3. 手指跟着路径来回移动，够大够明显
+      ctx.globalAlpha = 0.92;
+      ctx.translate(x, y + 18);
+      ctx.scale(1.45, 1.45);
+      ctx.fillStyle = '#FFFFFF';
+      ctx.strokeStyle = '#E6A65D';
+      ctx.lineWidth = 2.6;
+      ctx.beginPath(); ctx.arc(0, 0, 13, 0, TAU); ctx.fill(); ctx.stroke();
+      Art.roundRect(ctx, -5, 6, 13, 30, 6); ctx.fill(); ctx.stroke();
+      ctx.restore();
+    }
+
+    rotateDevice(ctx, time) {
+      ctx.save();
+      ctx.fillStyle = '#FFF8E8'; ctx.fillRect(0, 0, 960, 600);
+      ctx.strokeStyle = '#526B54'; ctx.lineWidth = 8;
+      Art.roundRect(ctx, 400, 120, 160, 280, 25); ctx.stroke();
+      ctx.beginPath(); ctx.arc(480, 260, 190, -Math.PI * 0.7, Math.PI * 0.45); ctx.stroke();
+      var angle = this.reduced ? Math.PI * 0.45 : Math.PI * 0.45 + Math.sin(time / 900) * 0.04;
+      var x = 480 + Math.cos(angle) * 190, y = 260 + Math.sin(angle) * 190;
+      ctx.fillStyle = '#526B54'; ctx.beginPath(); ctx.moveTo(x, y);
+      ctx.lineTo(x - 25, y - 4); ctx.lineTo(x - 8, y - 25); ctx.closePath(); ctx.fill();
+      ctx.restore();
+    }
+  }
+  window.TrainRenderer = TrainRenderer;
+}());
+
+</script>
+<script>
+(function () {
+  'use strict';
+
+  var TAU = Math.PI * 2;
+
+  function line(x0, y0, x1, y1, requires) {
+    return {
+      kind: 'line', requires: requires || null,
+      p0: { x: x0, y: y0 }, p1: { x: x1, y: y1 },
+      center: null, radius: null, a0: null, a1: null, direction: null
+    };
+  }
+
+  function arc(x0, y0, x1, y1, cx, cy, radius, a0, a1, direction, requires) {
+    return {
+      kind: 'arc', requires: requires || null,
+      p0: { x: x0, y: y0 }, p1: { x: x1, y: y1 },
+      center: { x: cx, y: cy }, radius: radius,
+      a0: a0, a1: a1, direction: direction
+    };
+  }
+
+  var SPECS = [
+    {
+      level: 0, shapes: ['H'], cards: [380],
+      animals: [['rabbit', 710, 340]],
+      segments: [
+        line(90, 340, 390, 340),
+        line(390, 340, 570, 340, 'g1'),
+        line(570, 340, 870, 340)
+      ]
+    },
+    {
+      level: 1, shapes: ['H', 'WN'], cards: [250, 510],
+      animals: [['dog', 430, 370], ['cat', 710, 230]],
+      segments: [
+        line(90, 370, 250, 370),
+        line(250, 370, 370, 370, 'g1'),
+        line(370, 370, 470, 370),
+        arc(470, 370, 540, 300, 470, 300, 70, Math.PI / 2, 0, -1, 'g2'),
+        arc(540, 300, 610, 230, 610, 300, 70, Math.PI, Math.PI * 3 / 2, 1),
+        line(610, 230, 870, 230)
+      ]
+    },
+    {
+      level: 2, shapes: ['H', 'WN', 'WS'], cards: [130, 380, 630],
+      animals: [['bear', 325, 365], ['squirrel', 565, 235], ['fox', 820, 365]],
+      segments: [
+        line(90, 365, 190, 365),
+        line(190, 365, 310, 365, 'g1'),
+        line(310, 365, 360, 365),
+        arc(360, 365, 425, 300, 360, 300, 65, Math.PI / 2, 0, -1, 'g2'),
+        arc(425, 300, 490, 235, 490, 300, 65, Math.PI, Math.PI * 3 / 2, 1),
+        line(490, 235, 650, 235),
+        arc(650, 235, 715, 300, 650, 300, 65, -Math.PI / 2, 0, 1, 'g3'),
+        arc(715, 300, 780, 365, 780, 300, 65, Math.PI, Math.PI / 2, -1),
+        line(780, 365, 870, 365)
+      ]
+    }
+  ];
+
+  function sample(segment) {
+    var dx = segment.p1.x - segment.p0.x;
+    var dy = segment.p1.y - segment.p0.y;
+    var length = segment.kind === 'arc'
+      ? Math.abs(segment.a1 - segment.a0) * segment.radius
+      : Math.sqrt(dx * dx + dy * dy);
+    var count = Math.max(1, Math.ceil(length / 3));
+    var heading = segment.kind === 'line' ? Math.atan2(dy, dx) : 0;
+    var points = [];
+
+    for (var i = 0; i <= count; i += 1) {
+      var t = i / count;
+      var x = segment.p0.x + dx * t;
+      var y = segment.p0.y + dy * t;
+      if (segment.kind === 'arc') {
+        var a = i === count ? segment.a1
+          : segment.a0 + segment.direction * length * t / segment.radius;
+        x = i === 0 ? segment.p0.x : i === count ? segment.p1.x
+          : segment.center.x + segment.radius * Math.cos(a);
+        y = i === 0 ? segment.p0.y : i === count ? segment.p1.y
+          : segment.center.y + segment.radius * Math.sin(a);
+        heading = Math.atan2(
+          Math.cos(a) * segment.direction,
+          -Math.sin(a) * segment.direction
+        );
+      }
+      points.push({ x: x, y: y, s: length * t, heading: heading });
+    }
+    return points;
+  }
+
+  function boundsFor(segment) {
+    var minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    segment.points.forEach(function (point) {
+      minX = Math.min(minX, point.x);
+      minY = Math.min(minY, point.y);
+      maxX = Math.max(maxX, point.x);
+      maxY = Math.max(maxY, point.y);
+    });
+    var bounds = { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
+    return { bounds: bounds, center: { x: minX + bounds.w / 2, y: minY + bounds.h / 2 } };
+  }
+
+  function nearestS(points, x, y) {
+    var best = Infinity, stopS = 0;
+    points.forEach(function (point) {
+      var dx = point.x - x, dy = point.y - y;
+      var distance = dx * dx + dy * dy;
+      if (distance < best) {
+        best = distance;
+        stopS = point.s;
+      }
+    });
+    return stopS;
+  }
+
+  function build(spec) {
+    var segments = [], points = [], totalLength = 0;
+    spec.segments.forEach(function (source, index) {
+      var segment = {
+        id: 's' + (index + 1), kind: source.kind, requires: source.requires,
+        p0: { x: source.p0.x, y: source.p0.y },
+        p1: { x: source.p1.x, y: source.p1.y },
+        center: source.center ? { x: source.center.x, y: source.center.y } : null,
+        radius: source.radius, a0: source.a0, a1: source.a1,
+        direction: source.direction, points: []
+      };
+      var sampled = sample(segment);
+      sampled.forEach(function (point, pointIndex) {
+        point.s += totalLength;
+        if (pointIndex > 0 || points.length === 0) points.push(point);
+      });
+      segment.points = sampled;
+      totalLength = sampled[sampled.length - 1].s;
+      segments.push(segment);
+    });
+
+    var gaps = spec.shapes.map(function (shape, index) {
+      var id = 'g' + (index + 1);
+      var segment = segments.filter(function (item) { return item.requires === id; })[0];
+      var box = boundsFor(segment);
+      return { id: id, shape: shape, segmentId: segment.id,
+        bounds: box.bounds, center: box.center };
+    });
+    var pieces = spec.shapes.map(function (shape, index) {
+      return { id: 'p' + (index + 1), shape: shape,
+        card: { x: spec.cards[index], y: 480, w: 200, h: 108 } };
+    });
+    var animals = spec.animals.map(function (animal) {
+      return { id: animal[0], kind: animal[0], stopS: nearestS(points, animal[1], animal[2]) };
+    });
+    return { level: spec.level, segments: segments, points: points,
+      totalLength: totalLength, pieces: pieces, gaps: gaps, animals: animals };
+  }
+
+  function pointAt(route, s) {
+    var points = route && route.points;
+    if (!points || points.length === 0) return { x: 0, y: 0, s: 0, heading: 0 };
+    var last = points[points.length - 1];
+    var value = typeof s === 'number' && isFinite(s) ? s : 0;
+    if (value <= points[0].s) return { x: points[0].x, y: points[0].y,
+      s: points[0].s, heading: points[0].heading };
+    if (value >= last.s) return { x: last.x, y: last.y, s: last.s, heading: last.heading };
+
+    var low = 0, high = points.length - 1;
+    while (high - low > 1) {
+      var middle = Math.floor((low + high) / 2);
+      if (points[middle].s <= value) low = middle;
+      else high = middle;
+    }
+    var a = points[low], b = points[high];
+    var t = (value - a.s) / (b.s - a.s);
+    var delta = ((b.heading - a.heading + Math.PI) % TAU + TAU) % TAU - Math.PI;
+    var heading = a.heading + delta * t;
+    return {
+      x: a.x + (b.x - a.x) * t,
+      y: a.y + (b.y - a.y) * t,
+      s: value,
+      heading: Math.atan2(Math.sin(heading), Math.cos(heading))
+    };
+  }
+
+  function get(level) {
+    return build(SPECS[level === undefined ? 0 : level] || SPECS[0]);
+  }
+
+  window.TrainRoutes = { get: get, pointAt: pointAt };
+}());
+
+</script>
+<script>
+(function () {
+  'use strict';
+  var PHASES = ['build', 'departWait', 'running', 'boarding', 'celebrate'];
+  var hasOwn = Object.prototype.hasOwnProperty;
+  function clone(value) {
+    return value == null ? value : JSON.parse(JSON.stringify(value));
+  }
+  function rectOf(value) {
+    if (!value) return null;
+    var r = value.rect || value.bounds || value;
+    if (![r.x, r.y, r.w, r.h].every(Number.isFinite)) return null;
+    return { x: r.x, y: r.y, w: r.w, h: r.h };
+  }
+  function button(id, type, x, y, w, h) {
+    return { id: id, type: type, rect: { x: x, y: y, w: w, h: h } };
+  }
+  class TrainModel {
+    constructor(level) {
+      this.muted = this._readMuted();
+      if (!this.chooseLevel(level == null ? 0 : level)) this.chooseLevel(0);
+    }
+    _readMuted() {
+      try {
+        var raw = window.localStorage.getItem('animalTrain.prefs');
+        if (!raw) return false;
+        var prefs = JSON.parse(raw);
+        return typeof prefs === 'boolean' ? prefs : Boolean(prefs && prefs.muted);
+      } catch (error) {
+        return false;
+      }
+    }
+    _savePrefs() {
+      try {
+        var prefs = {};
+        var raw = window.localStorage.getItem('animalTrain.prefs');
+        if (raw) {
+          var saved = JSON.parse(raw);
+          if (saved && typeof saved === 'object' && !Array.isArray(saved)) prefs = saved;
+        }
+        prefs.muted = this.muted;
+        window.localStorage.setItem('animalTrain.prefs', JSON.stringify(prefs));
+      } catch (error) {
+        // Storage may be disabled; the in-memory preference still works.
+      }
+    }
+    _saveProgress() {
+      try {
+        window.localStorage.setItem('animalTrain.progress', JSON.stringify({ level: this.level }));
+      } catch (error) {
+        // Completion must not depend on storage availability.
+      }
+    }
+    chooseLevel(level) {
+      if (!Number.isInteger(level) || level < 0 || level > 2) return false;
+      var route = window.TrainRoutes.get(level);
+      this.level = level;
+      this.route = route;
+      this.phase = 'build';
+      this.placements = {};
+      this.tray = route.pieces.map(function (piece) {
+        return { id: piece.id, shape: piece.shape };
+      });
+      this.selectedPiece = null;
+      this.selectedGap = null;
+      this.history = [];
+      this.pendingLaunchMs = 0;
+      this.idleMs = 0;
+      this.train = { s: 0 };
+      this.animals = route.animals.map(function (animal) {
+        return { id: animal.id, kind: animal.kind, stopS: animal.stopS, boarded: false };
+      });
+      this.boardingAnimalId = null;
+      this.boardingRemainingMs = 0;
+      this.events = [];
+      this.hornCooldownMs = 0;
+      this.hornPulse = 0;
+      return true;
+    }
+    getState() {
+      var s = this.train.s;
+      var head = this.pointAt(s);
+      return clone({
+        phase: this.phase, level: this.level,
+        placements: this.placements, tray: this.tray,
+        historyLength: this.history.length,
+        selectedPiece: this.selectedPiece, selectedGap: this.selectedGap,
+        pendingLaunchMs: this.pendingLaunchMs, idleMs: this.idleMs,
+        train: {
+          s: s, x: head.x, y: head.y, heading: head.heading,
+          cars: [head, this.pointAt(s - 42), this.pointAt(s - 84)]
+        },
+        animals: this.animals,
+        boardingAnimalId: this.boardingAnimalId,
+        muted: this.muted,
+        hornCooldownMs: this.hornCooldownMs, hornPulse: this.hornPulse,
+        sceneChoices: this.phase === 'celebrate' && this.level === 2 ? [0, 1, 2] : []
+      });
+    }
+    getGeometry() {
+      return this.route;
+    }
+    pointAt(s) {
+      return window.TrainRoutes.pointAt(this.route, s);
+    }
+    _pieceRect(piece) {
+      var source = this.route.pieces.find(function (candidate) {
+        return candidate.id === piece.id;
+      });
+      return rectOf(source && source.card) || rectOf(source || piece);
+    }
+    getHitTargets() {
+      var targets = [
+        button('horn', 'horn', 724, 6, 104, 104),
+        button('mute', 'mute', 832, 6, 104, 104)
+      ];
+      var self = this;
+      if (this.phase === 'build' || this.phase === 'departWait') {
+        targets.push(button('undo', 'undo', 616, 6, 104, 104));
+        this.tray.forEach(function (piece) {
+          var rect = self._pieceRect(piece);
+          if (rect) targets.push({ id: piece.id, type: 'piece', rect: rect, shape: piece.shape });
+        });
+        this.route.gaps.forEach(function (gap) {
+          if (hasOwn.call(self.placements, gap.id)) return;
+          var rect = rectOf(gap.bounds || gap);
+          if (!rect) return;
+          rect.x -= 28;
+          rect.y -= 28;
+          rect.w += 56;
+          rect.h += 56;
+          targets.push({ id: gap.id, type: 'gap', rect: rect, shape: gap.shape });
+        });
+      }
+      if (this.phase === 'running' || this.phase === 'boarding') {
+        targets.push(button('replay', 'replay', 616, 6, 104, 104));
+      }
+      if (this.phase === 'celebrate' && this.level !== 2) {
+        targets.push(button('next', 'next', 670, 486, 230, 100));
+        targets.push(button('replay', 'replay', 480, 486, 160, 100));
+      }
+      if (this.phase === 'celebrate' && this.level === 2) {
+        [140, 380, 620].forEach(function (x, level) {
+          targets.push(button(level, 'level', x, 482, 200, 108));
+        });
+      }
+      return targets;
+    }
+    hitTest(x, y) {
+      var targets = this.getHitTargets();
+      for (var i = targets.length - 1; i >= 0; i -= 1) {
+        var target = targets[i];
+        var r = target.rect;
+        if (x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) return target;
+      }
+      return null;
+    }
+    selectPiece(pieceId) {
+      if (pieceId === null) {
+        this.selectedPiece = null;
+        return false;
+      }
+      if (this.phase !== 'build' && this.phase !== 'departWait') return false;
+      if (!this.tray.some(function (piece) { return piece.id === pieceId; })) return false;
+      this.idleMs = 0;
+      if (this.selectedGap !== null) {
+        var placed = this.place(pieceId, this.selectedGap);
+        this.selectedPiece = null;
+        this.selectedGap = null;
+        return placed;
+      }
+      this.selectedPiece = pieceId;
+      return true;
+    }
+    selectGap(gapId) {
+      if (gapId === null) {
+        this.selectedGap = null;
+        return false;
+      }
+      if (this.phase !== 'build' && this.phase !== 'departWait') return false;
+      var gap = this.route.gaps.find(function (candidate) { return candidate.id === gapId; });
+      if (!gap || hasOwn.call(this.placements, gapId)) return false;
+      this.idleMs = 0;
+      if (this.selectedPiece !== null) {
+        var placed = this.place(this.selectedPiece, gapId);
+        this.selectedPiece = null;
+        this.selectedGap = null;
+        return placed;
+      }
+      this.selectedGap = gapId;
+      return true;
+    }
+    _soft() {
+      this.events.push({ type: 'soft' });
+      return false;
+    }
+    place(pieceId, gapId) {
+      if (this.phase !== 'build' && this.phase !== 'departWait') return this._soft();
+      var pieceIndex = this.tray.findIndex(function (piece) { return piece.id === pieceId; });
+      var gap = this.route.gaps.find(function (candidate) { return candidate.id === gapId; });
+      if (pieceIndex < 0 || !gap || hasOwn.call(this.placements, gapId)) return this._soft();
+      if (this.tray[pieceIndex].shape !== gap.shape) return this._soft();
+      this.placements[gapId] = pieceId;
+      this.tray.splice(pieceIndex, 1);
+      this.history.push({ pieceId: pieceId, gapId: gapId });
+      this.selectedPiece = null;
+      this.selectedGap = null;
+      this.idleMs = 0;
+      this.events.push({ type: 'place' });
+      var placements = this.placements;
+      if (this.route.gaps.every(function (item) { return hasOwn.call(placements, item.id); })) {
+        this.phase = 'departWait';
+        this.pendingLaunchMs = 800;
+      }
+      return true;
+    }
+    drop(pieceId, gapId) {
+      if (gapId !== null) return this.place(pieceId, gapId);
+      this.selectedPiece = null;
+      this.selectedGap = null;
+      return this._soft();
+    }
+    undo() {
+      if (this.phase !== 'build' && this.phase !== 'departWait') return false;
+      if (!this.history.length) return false;
+      var entry = this.history.pop();
+      var piece = this.route.pieces.find(function (candidate) {
+        return candidate.id === entry.pieceId;
+      });
+      this.tray.push({ id: piece.id, shape: piece.shape });
+      delete this.placements[entry.gapId];
+      this.selectedPiece = null;
+      this.selectedGap = null;
+      this.idleMs = 0;
+      if (this.phase === 'departWait') {
+        this.phase = 'build';
+        this.pendingLaunchMs = 0;
+      }
+      return true;
+    }
+    _emitHorn() {
+      this.hornPulse += 1;
+      this.hornCooldownMs = 600;
+      this.events.push({ type: 'horn' });
+    }
+    _advanceRunning(dt) {
+      var before = this.train.s;
+      var nextS = before + 96 * dt / 1000;
+      var stopped = null;
+      this.animals.forEach(function (animal) {
+        if (animal.boarded || animal.stopS < before || animal.stopS > nextS) return;
+        if (!stopped || animal.stopS < stopped.stopS) stopped = animal;
+      });
+      if (stopped) {
+        this.train.s = stopped.stopS;
+        this.phase = 'boarding';
+        this.boardingAnimalId = stopped.id;
+        this.boardingRemainingMs = 1200;
+        return;
+      }
+      this.train.s = nextS;
+      var waiting = this.animals.some(function (animal) { return !animal.boarded; });
+      if (!waiting && nextS >= this.route.totalLength) {
+        this.train.s = this.route.totalLength;
+        this.phase = 'celebrate';
+        this.events.push({ type: 'celebrate' });
+        this._saveProgress();
+      }
+    }
+    _advanceBoarding(dt) {
+      this.boardingRemainingMs -= dt;
+      if (this.boardingRemainingMs > 0) return;
+      var animal = this.animals.find(function (candidate) {
+        return candidate.id === this.boardingAnimalId;
+      }, this);
+      if (animal) animal.boarded = true;
+      var animalId = this.boardingAnimalId;
+      this.boardingAnimalId = null;
+      this.boardingRemainingMs = 0;
+      this.events.push({ type: 'board', animalId: animalId });
+      this.phase = 'running';
+      this.train.s += 0.001;
+    }
+    advance(ms) {
+      var remaining = Number(ms);
+      if (!Number.isFinite(remaining) || remaining <= 0) return;
+      while (remaining > 0) {
+        var dt = Math.min(25, remaining);
+        remaining -= dt;
+        this.hornCooldownMs = Math.max(0, this.hornCooldownMs - dt);
+        if (this.phase === 'build') {
+          this.idleMs += dt;
+        } else if (this.phase === 'departWait') {
+          this.pendingLaunchMs -= dt;
+          if (this.pendingLaunchMs <= 0) {
+            this.pendingLaunchMs = 0;
+            this.phase = 'running';
+            this.events.push({ type: 'depart' });
+            this._emitHorn();
+          }
+        } else if (this.phase === 'running') {
+          this._advanceRunning(dt);
+        } else if (this.phase === 'boarding') {
+          this._advanceBoarding(dt);
+        }
+      }
+    }
+    horn() {
+      if (PHASES.indexOf(this.phase) < 0 || this.hornCooldownMs > 0) return false;
+      this._emitHorn();
+      return true;
+    }
+    setMuted(muted) {
+      this.muted = Boolean(muted);
+      this._savePrefs();
+      return this.muted;
+    }
+    next() {
+      if (this.phase !== 'celebrate' || this.level === 2) return false;
+      return this.chooseLevel(this.level + 1);
+    }
+    replay() {
+      return this.chooseLevel(this.level);
+    }
+    consumeEvents() {
+      var events = this.events;
+      this.events = [];
+      return events;
+    }
+  }
+  window.TrainModel = TrainModel;
+})();
+
+</script>
+<script>
+(function () {
+  'use strict';
+
+  function ignore() {}
+
+  class TrainAudio {
+    constructor() {
+      this.ctx = null;
+      this.master = null;
+      this.unlocked = false;
+      this.hidden = false;
+    }
+
+    unlock() {
+      try {
+        if (!this.ctx) {
+          var AudioContext = window.AudioContext || window.webkitAudioContext;
+          if (!AudioContext) return;
+          this.ctx = new AudioContext();
+        }
+        if (!this.master) {
+          var master = this.ctx.createGain();
+          master.gain.value = 0.12;
+          master.connect(this.ctx.destination);
+          this.master = master;
+        }
+        this.unlocked = true;
+        this._resume();
+      } catch (_) {}
+    }
+
+    _resume() {
+      try {
+        if (!this.ctx || typeof this.ctx.resume !== 'function') return;
+        var pending = this.ctx.resume();
+        if (pending && typeof pending.catch === 'function') pending.catch(ignore);
+      } catch (_) {}
+    }
+
+    _tone(frequency, endFrequency, duration, volume, delay) {
+      var ctx = this.ctx;
+      var start = ctx.currentTime + (delay || 0);
+      var end = start + duration;
+      var oscillator = ctx.createOscillator();
+      var gain = ctx.createGain();
+      oscillator.type = 'sine';
+      oscillator.frequency.setValueAtTime(frequency, start);
+      if (endFrequency !== frequency) {
+        oscillator.frequency.exponentialRampToValueAtTime(endFrequency, end);
+      }
+      gain.gain.setValueAtTime(0.0001, start);
+      gain.gain.exponentialRampToValueAtTime(volume, start + 0.008);
+      gain.gain.exponentialRampToValueAtTime(0.0001, end);
+      oscillator.connect(gain);
+      gain.connect(this.master);
+      oscillator.onended = function () {
+        try {
+          oscillator.disconnect();
+          gain.disconnect();
+        } catch (_) {}
+      };
+      oscillator.start(start);
+      oscillator.stop(end + 0.02);
+    }
+
+    handle(events, muted) {
+      if (muted || this.hidden || !this.unlocked || !this.ctx || !this.master) return;
+      var list = Array.isArray(events) ? events : [events];
+      for (var i = 0; i < list.length; i += 1) {
+        try {
+          var event = list[i];
+          var type = typeof event === 'string' ? event : event &&
+            (event.type || event.name || event.kind || event.event);
+          switch (type) {
+            case 'place':
+              this._tone(220, 110, 0.18, 0.4, 0);
+              this._tone(660, 660, 0.055, 0.1, 0.012);
+              break;
+            case 'soft':
+              this._tone(240, 210, 0.25, 0.22, 0);
+              break;
+            case 'horn':
+              this._tone(392, 392, 0.65, 0.22, 0);
+              this._tone(523.25, 523.25, 0.65, 0.17, 0);
+              break;
+            case 'board':
+              this._tone(660, 660, 0.1, 0.2, 0);
+              break;
+            case 'celebrate':
+              this._tone(523.25, 523.25, 0.22, 0.22, 0);
+              this._tone(659.25, 659.25, 0.22, 0.22, 0.12);
+              this._tone(783.99, 783.99, 0.22, 0.22, 0.24);
+              this._tone(1046.5, 1046.5, 0.3, 0.24, 0.36);
+              break;
+            case 'depart':
+            default:
+              break;
+          }
+        } catch (_) {}
+      }
+    }
+
+    setHidden(hidden) {
+      this.hidden = !!hidden;
+      try {
+        if (!this.unlocked || !this.ctx) return;
+        var method = this.hidden ? 'suspend' : 'resume';
+        if (typeof this.ctx[method] !== 'function') return;
+        var pending = this.ctx[method]();
+        if (pending && typeof pending.catch === 'function') pending.catch(ignore);
+      } catch (_) {}
+    }
+  }
+
+  window.TrainAudio = TrainAudio;
+})();
+
+</script>
+<script>
+(() => {
+  'use strict';
+
+  const WIDTH = 960;
+  const HEIGHT = 600;
+  const MAX_DPR = 2;
+  const MAX_DT = 50;
+  const DRAG_DISTANCE = 10;
+
+  const canvas = document.getElementById('cv');
+  if (!canvas) return;
+
+  const ctx = canvas.getContext('2d');
+  const model = new TrainModel();
+  const renderer = new TrainRenderer(canvas, model);
+  let audio = null;
+
+  try {
+    if (typeof TrainAudio === 'function') audio = new TrainAudio();
+  } catch (_) {
+    // A missing or blocked Web Audio implementation must not stop play.
+  }
+
+  let dpr = 1;
+  let portrait = false;
+  let gesture = null;
+  let lastTime = 0;
+  let clockMs = 0;
+
+  function audioCall(method, ...args) {
+    if (!audio || typeof audio[method] !== 'function') return;
+    try {
+      const result = audio[method](...args);
+      if (result && typeof result.catch === 'function') result.catch(() => {});
+    } catch (_) {
+      // Audio is an enhancement; model and pointer behavior stay functional.
+    }
+  }
+
+  function stateMuted() {
+    const state = model.getState();
+    return !!(state && state.muted);
+  }
+
+  function flushEvents() {
+    audioCall('handle', model.consumeEvents(), stateMuted());
+  }
+
+  function isFrozen() {
+    return !!document.hidden || portrait;
+  }
+
+  function updateAudioVisibility() {
+    audioCall('setHidden', isFrozen());
+  }
+
+  function viewportSize() {
+    const viewport = window.visualViewport;
+    const width = viewport && viewport.width > 0 ? viewport.width : window.innerWidth;
+    const height = viewport && viewport.height > 0 ? viewport.height : window.innerHeight;
+    return {
+      width: width > 0 ? width : WIDTH,
+      height: height > 0 ? height : HEIGHT
+    };
+  }
+
+  function releaseCapture(pointerId) {
+    if (typeof canvas.releasePointerCapture !== 'function') return;
+    try {
+      canvas.releasePointerCapture(pointerId);
+    } catch (_) {
+      // Capture may already have been released by the browser.
+    }
+  }
+
+  function cancelGesture(pointerId, shouldRelease = true) {
+    if (!gesture) return;
+    if (pointerId !== undefined && gesture.pointerId !== pointerId) return;
+    const capturedId = gesture.pointerId;
+    gesture = null;
+    renderer.drag = null;
+    if (shouldRelease) releaseCapture(capturedId);
+  }
+
+  function resizeCanvas() {
+    const size = viewportSize();
+    const scale = Math.max(0.0001, Math.min(size.width / WIDTH, size.height / HEIGHT));
+    const cssWidth = WIDTH * scale;
+    const cssHeight = HEIGHT * scale;
+    const nextPortrait = size.height > size.width;
+    const pixelRatio = Number(window.devicePixelRatio);
+
+    dpr = Math.min(MAX_DPR, Number.isFinite(pixelRatio) && pixelRatio > 0 ? pixelRatio : 1);
+    canvas.width = Math.round(WIDTH * dpr);
+    canvas.height = Math.round(HEIGHT * dpr);
+    canvas.style.width = cssWidth + 'px';
+    canvas.style.height = cssHeight + 'px';
+
+    if (ctx && typeof ctx.setTransform === 'function') {
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+
+    if (nextPortrait !== portrait) cancelGesture();
+    portrait = nextPortrait;
+    renderer.portrait = portrait;
+    lastTime = 0;
+    updateAudioVisibility();
+
+    return {
+      width: canvas.width,
+      height: canvas.height,
+      cssWidth: canvas.style.width,
+      cssHeight: canvas.style.height,
+      dpr
+    };
+  }
+
+  function renderAfterResize() {
+    const metrics = resizeCanvas();
+    if (!document.hidden) renderer.render(clockMs);
+    return metrics;
+  }
+
+  function clientToLogical(clientX, clientY) {
+    const rect = canvas.getBoundingClientRect();
+    return {
+      x: (clientX - rect.left) * WIDTH / rect.width,
+      y: (clientY - rect.top) * HEIGHT / rect.height
+    };
+  }
+
+  function hitAt(x, y) {
+    const hit = model.hitTest(x, y);
+    if (!hit) return null;
+    if (typeof hit === 'object') return hit;
+    const targets = model.getHitTargets();
+    return targets.find((target) => target.id === hit) || null;
+  }
+
+  function gapAt(x, y) {
+    const hit = hitAt(x, y);
+    return hit && hit.type === 'gap' ? hit : null;
+  }
+
+  function focusCanvas() {
+    if (typeof canvas.focus !== 'function') return;
+    try {
+      canvas.focus({ preventScroll: true });
+    } catch (_) {
+      canvas.focus();
+    }
+  }
+
+  function parseLevel(id) {
+    if (typeof id === 'number') return Number.isFinite(id) ? id : null;
+    if (typeof id !== 'string') return null;
+    const match = /^(?:level-)?(\d+)$/.exec(id.trim());
+    return match ? Number(match[1]) : null;
+  }
+
+  function clearSelection() {
+    // Models that support null selections clear both; others simply ignore it.
+    try { model.selectPiece(null); } catch (_) { /* Optional model behavior. */ }
+    try { model.selectGap(null); } catch (_) { /* Optional model behavior. */ }
+  }
+
+  function activateTarget(target) {
+    if (!target) {
+      clearSelection();
+      return;
+    }
+
+    switch (target.type) {
+      case 'piece':
+        model.selectPiece(target.id);
+        break;
+      case 'gap':
+        model.selectGap(target.id);
+        break;
+      case 'horn':
+        model.horn();
+        break;
+      case 'mute':
+        model.setMuted(!stateMuted());
+        break;
+      case 'undo':
+        model.undo();
+        break;
+      case 'replay':
+        model.replay();
+        break;
+      case 'next':
+        model.next();
+        break;
+      case 'level': {
+        const level = parseLevel(target.id);
+        if (level !== null) model.chooseLevel(level);
+        break;
+      }
+      default:
+        break;
+    }
+  }
+
+  function pointerDown(point, pointerId) {
+    audioCall('unlock');
+    if (isFrozen() || gesture) return;
+
+    gesture = {
+      pointerId,
+      startX: point.x,
+      startY: point.y,
+      x: point.x,
+      y: point.y,
+      target: hitAt(point.x, point.y),
+      dragging: false,
+      targetGapId: null
+    };
+
+    focusCanvas();
+    if (typeof canvas.setPointerCapture === 'function') {
+      try {
+        canvas.setPointerCapture(pointerId);
+      } catch (_) {
+        // Synthetic pointers and older browsers may not support capture.
+      }
+    }
+  }
+
+  function pointerMove(point, pointerId) {
+    if (!gesture || gesture.pointerId !== pointerId) return;
+    if (isFrozen()) {
+      cancelGesture(pointerId);
+      return;
+    }
+
+    gesture.x = point.x;
+    gesture.y = point.y;
+    if (!gesture.target || gesture.target.type !== 'piece') return;
+
+    const gap = gapAt(point.x, point.y);
+    gesture.targetGapId = gap ? gap.id : null;
+    const dx = point.x - gesture.startX;
+    const dy = point.y - gesture.startY;
+
+    if (gesture.dragging || dx * dx + dy * dy > DRAG_DISTANCE * DRAG_DISTANCE) {
+      gesture.dragging = true;
+      renderer.drag = {
+        pieceId: gesture.target.id,
+        x: point.x,
+        y: point.y - 40,
+        targetGapId: gesture.targetGapId
+      };
+    }
+  }
+
+  function pointerUp(point, pointerId) {
+    if (!gesture || gesture.pointerId !== pointerId) return;
+
+    const completed = gesture;
+    gesture = null;
+    renderer.drag = null;
+    releaseCapture(pointerId);
+
+    if (!isFrozen()) {
+      if (completed.dragging) {
+        model.drop(
+          completed.target.id,
+          completed.targetGapId === null ? null : completed.targetGapId
+        );
+      } else {
+        activateTarget(completed.target);
+      }
+    }
+    flushEvents();
+  }
+
+  function pointerCancel(pointerId) {
+    cancelGesture(pointerId);
+  }
+
+  function routePointer(type, point, pointerId) {
+    switch (type) {
+      case 'down':
+        pointerDown(point, pointerId);
+        break;
+      case 'move':
+        pointerMove(point, pointerId);
+        break;
+      case 'up':
+        pointerUp(point, pointerId);
+        break;
+      case 'cancel':
+        pointerCancel(pointerId);
+        break;
+      default:
+        break;
+    }
+  }
+
+  function onPointerEvent(event) {
+    const type = event.type.slice('pointer'.length);
+    const isMouseSecondary = event.pointerType === 'mouse' &&
+      ((type === 'down' && event.button !== 0) || event.isPrimary === false);
+    if (isMouseSecondary) return;
+
+    // A non-primary touch is ignored even if the first touch began elsewhere.
+    if (event.pointerType === 'touch' && event.isPrimary === false) return;
+    if (gesture && gesture.pointerId !== event.pointerId) return;
+
+    const point = clientToLogical(event.clientX, event.clientY);
+    if ((type === 'down' && !isFrozen() && !gesture) ||
+        (gesture && gesture.pointerId === event.pointerId)) {
+      event.preventDefault();
+    }
+    routePointer(type, point, event.pointerId);
+  }
+
+  function onKeyDown(event) {
+    audioCall('unlock');
+    const key = String(event.key || '').toLowerCase();
+    const modified = event.ctrlKey || event.metaKey || event.altKey;
+    let handled = true;
+
+    if (key === 'm' && !modified) {
+      model.setMuted(!stateMuted());
+    } else if (!isFrozen() && !modified && key === 'h') {
+      model.horn();
+    } else if (!isFrozen() && !modified && key === 'u') {
+      model.undo();
+    } else if (!isFrozen() && !modified && key === 'r') {
+      model.replay();
+    } else {
+      handled = false;
+    }
+
+    if (handled) event.preventDefault();
+    flushEvents();
+  }
+
+  function manualAdvance(ms) {
+    const value = Number(ms);
+    const dt = Number.isFinite(value) ? Math.max(0, value) : 0;
+    model.advance(dt);
+    clockMs += dt;
+    flushEvents();
+    renderer.render(clockMs);
+    return model.getState();
+  }
+
+  function frame(timeMs) {
+    if (isFrozen()) {
+      lastTime = 0;
+    } else {
+      const rawDt = lastTime > 0 ? timeMs - lastTime : 0;
+      const dt = Number.isFinite(rawDt) ? Math.min(MAX_DT, Math.max(0, rawDt)) : 0;
+      lastTime = Number.isFinite(timeMs) ? timeMs : 0;
+      clockMs += dt;
+      model.advance(dt);
+      flushEvents();
+      renderer.render(clockMs);
+    }
+    window.requestAnimationFrame(frame);
+  }
+
+  function testPointer(type, x, y, pointerId = 1) {
+    let name = String(type || '').toLowerCase();
+    if (name.indexOf('pointer') === 0) name = name.slice('pointer'.length);
+    if (name === 'lostpointercapture') name = 'cancel';
+    routePointer(name, { x: Number(x), y: Number(y) }, pointerId);
+    return model.getState();
+  }
+
+  if (!canvas.hasAttribute('tabindex')) canvas.tabIndex = 0;
+  renderer.drag = null;
+
+  // Start directly on level one; no menu or intermediate screen.
+  model.chooseLevel(0);
+  resizeCanvas();
+  flushEvents();
+  renderer.render(0);
+
+  canvas.addEventListener('pointerdown', onPointerEvent, { passive: false });
+  canvas.addEventListener('pointermove', onPointerEvent, { passive: false });
+  canvas.addEventListener('pointerup', onPointerEvent, { passive: false });
+  canvas.addEventListener('pointercancel', onPointerEvent, { passive: false });
+  canvas.addEventListener('lostpointercapture', (event) => {
+    cancelGesture(event.pointerId, false);
+  });
+
+  window.addEventListener('blur', () => cancelGesture());
+  window.addEventListener('keydown', onKeyDown);
+  window.addEventListener('resize', renderAfterResize);
+  if (window.visualViewport && typeof window.visualViewport.addEventListener === 'function') {
+    window.visualViewport.addEventListener('resize', renderAfterResize);
+  }
+
+  document.addEventListener('visibilitychange', () => {
+    lastTime = 0;
+    if (document.hidden) cancelGesture();
+    updateAudioVisibility();
+    if (!document.hidden) renderer.render(clockMs);
+  });
+
+  window.__animalTrain = {
+    getState: model.getState.bind(model),
+    getGeometry: model.getGeometry.bind(model),
+    getHitTargets: model.getHitTargets.bind(model),
+    selectPiece: model.selectPiece.bind(model),
+    selectGap: model.selectGap.bind(model),
+    place: model.place.bind(model),
+    drop: model.drop.bind(model),
+    undo: model.undo.bind(model),
+    horn: model.horn.bind(model),
+    setMuted: model.setMuted.bind(model),
+    next: model.next.bind(model),
+    replay: model.replay.bind(model),
+    chooseLevel: model.chooseLevel.bind(model),
+    advance: manualAdvance,
+    resize: renderAfterResize,
+    pointer: testPointer
+  };
+
+  lastTime = 0;
+  window.requestAnimationFrame(frame);
+})();
+
+</script>
+</body>
+</html>

@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="zh-Hant-HK">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>小遊戲合集</title>
+<meta name="description" content="自己整嘅網頁小遊戲：幼兒學習遊戲同雙人對戰，免安裝、免登入，打開就玩。">
+<style>
+  :root {
+    --bg: #f6f3ec; --card: #fff; --ink: #1f2430; --muted: #6b7280; --line: #e6e1d6;
+    --accent: #e8590c; --chip: #fff1e6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #15171c; --card: #1e2128; --ink: #eceef2; --muted: #9aa1ad; --line: #2c3039; --chip: #3a2618; }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 16px/1.6 -apple-system, BlinkMacSystemFont, "PingFang HK", "Noto Sans TC", sans-serif;
+  }
+  main { max-width: 1040px; margin: 0 auto; padding: 48px 16px 64px; }
+  h1 { font-size: 32px; margin: 0 0 6px; letter-spacing: .02em; }
+  .lead { color: var(--muted); margin: 0 0 40px; }
+  h2 { font-size: 18px; margin: 40px 0 4px; }
+  .sub { color: var(--muted); font-size: 14px; margin: 0 0 16px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 20px; }
+  a.card {
+    display: block; text-decoration: none; color: inherit; background: var(--card);
+    border: 1px solid var(--line); border-radius: 14px; overflow: hidden;
+    transition: transform .15s ease, box-shadow .15s ease;
+  }
+  a.card:hover, a.card:focus-visible { transform: translateY(-3px); box-shadow: 0 10px 24px rgba(0,0,0,.08); outline: none; }
+  a.card img { display: block; width: 100%; aspect-ratio: 8 / 5; object-fit: cover; background: var(--line); }
+  .body { padding: 14px 16px 16px; }
+  .name { font-weight: 700; font-size: 17px; margin: 0 0 4px; }
+  .desc { color: var(--muted); font-size: 14px; margin: 0 0 10px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip { font-size: 12px; padding: 2px 8px; border-radius: 99px; background: var(--chip); color: var(--accent); }
+  footer { margin-top: 56px; color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>小遊戲合集</h1>
+  <p class="lead">自己整嘅網頁小遊戲。免安裝、免登入，打開就玩。</p>
+
+  <h2>幼兒 · 玩中學</h2>
+  <p class="sub">建議 iPad 打橫玩，有廣東話語音，冇輸、冇扣分。</p>
+  <div class="grid">
+    <a class="card" href="metro-driver/">
+      <img src="thumbs/metro-driver.jpg?v=1" alt="地鐵小司機遊戲畫面" loading="lazy">
+      <div class="body">
+        <p class="name">地鐵小司機</p>
+        <p class="desc">揸地鐵：按住開車、放手停車，開門接小動物，沿途搵字、數數、記嘢、等紅燈。</p>
+        <div class="chips"><span class="chip">3–5 歲</span><span class="chip">專注</span><span class="chip">認字數數</span></div>
+      </div>
+    </a>
+    <a class="card" href="signal-master/">
+      <img src="thumbs/signal-master.jpg?v=1" alt="紅綠燈站長遊戲畫面" loading="lazy">
+      <div class="body">
+        <p class="name">紅綠燈站長</p>
+        <p class="desc">做站長睇訊號燈放車：紅燈忍住、等埋乘客、相反遊戲、規則中途變。難度自動調，過關收集列車。</p>
+        <div class="chips"><span class="chip">3–5 歲</span><span class="chip">忍耐</span><span class="chip">規則轉換</span></div>
+      </div>
+    </a>
+    <a class="card" href="animal-train/">
+      <img src="thumbs/animal-train.jpg?v=1" alt="動物小火車遊戲畫面" loading="lazy">
+      <div class="body">
+        <p class="name">動物小火車</p>
+        <p class="desc">砌好路軌，小火車就會出發，沿途接小動物返到終點。三關，點選或者拖放都得。</p>
+        <div class="chips"><span class="chip">2–4 歲</span><span class="chip">空間</span><span class="chip">配對</span></div>
+      </div>
+    </a>
+  </div>
+
+  <h2>雙人對戰</h2>
+  <p class="sub">用電腦鍵盤或者手掣玩，兩個人同一部機。</p>
+  <div class="grid">
+    <a class="card" href="tank-duel/">
+      <img src="thumbs/tank-duel.jpg?v=1" alt="坦克對決遊戲畫面" loading="lazy">
+      <div class="body">
+        <p class="name">坦克對決</p>
+        <p class="desc">雙人同屏或者對電腦，可以打爛掩體、食道具，回合制。</p>
+        <div class="chips"><span class="chip">雙人</span><span class="chip">人機</span><span class="chip">鍵盤 / 手掣</span></div>
+      </div>
+    </a>
+    <a class="card" href="twin-drive/">
+      <img src="thumbs/twin-drive.jpg?v=1" alt="雙人一車遊戲畫面" loading="lazy">
+      <div class="body">
+        <p class="name">雙人一車</p>
+        <p class="desc">兩個人揸一架車：一個轉軚踩油，一個換波煞車睇雷達，唔換波最多 28 km/h。</p>
+        <div class="chips"><span class="chip">雙人合作</span><span class="chip">拉力賽</span><span class="chip">鍵盤</span></div>
+      </div>
+    </a>
+  </div>
+
+  <footer>同港鐵公司無關。遊戲進度只存喺你部機嘅瀏覽器入面。</footer>
+</main>
+</body>
+</html>

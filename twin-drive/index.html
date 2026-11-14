@@ -1,0 +1,3183 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>双人一车 · Twin Drive</title>
+<style>
+  html,body{margin:0;height:100%;background:#05070c;overflow:hidden;touch-action:none;
+    font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+    -webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent;}
+  #stage{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;}
+  canvas{display:block;border-radius:14px;touch-action:none;
+    box-shadow:0 0 0 1px #151c28, 0 24px 70px -20px rgba(0,0,0,.95), 0 0 140px -50px rgba(255,179,71,.35);}
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="cv"></canvas></div>
+<script>
+(function () {
+'use strict';
+
+/* ═══════════════ 0. 基础工具 ═══════════════ */
+const W = 960, H = 600;
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+const DPR = Math.min(2, (typeof window !== 'undefined' && window.devicePixelRatio) || 1);
+cv.width = W * DPR; cv.height = H * DPR;
+
+function fit() {
+  const pad = 22;
+  const s = Math.min((innerWidth - pad) / W, (innerHeight - pad) / H);
+  cv.style.width = Math.round(W * s) + 'px';
+  cv.style.height = Math.round(H * s) + 'px';
+}
+if (typeof addEventListener === 'function') addEventListener('resize', fit);
+fit();
+
+const TAU = Math.PI * 2;
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const lerp = (a, b, t) => a + (b - a) * t;
+const approach = (v, t, d) => (v < t ? Math.min(t, v + d) : Math.max(t, v - d));
+const dist2 = (ax, ay, bx, by) => { const dx = ax - bx, dy = ay - by; return dx * dx + dy * dy; };
+const angDiff = (a, b) => ((b - a + Math.PI * 3) % TAU) - Math.PI;
+
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const rr = (rng, a, b) => a + rng() * (b - a);
+
+/** 稳定的整数散列，用于"按里程种出"路边装饰（不需要存列表，天然可裁剪） */
+function hash2(i, salt) {
+  let h = Math.imul((i | 0) ^ (salt | 0), 2654435761) >>> 0;
+  h ^= h >>> 15; h = Math.imul(h, 2246822507) >>> 0; h ^= h >>> 13;
+  return (h >>> 0) / 4294967296;
+}
+
+function fmtTime(s) {
+  if (!isFinite(s) || s < 0) s = 0;
+  const m = Math.floor(s / 60);
+  const r = s - m * 60;
+  return m + ':' + (r < 10 ? '0' : '') + r.toFixed(1);
+}
+function kmh(pxPerSec) { return pxPerSec * 0.3; }            // 12px = 1m，330px/s ≈ 99km/h
+function meters(px) { return px / 12; }
+
+function roundRect(c, x, y, w, h, r) {
+  const k = Math.min(r, Math.abs(w) / 2, Math.abs(h) / 2);
+  c.beginPath();
+  c.moveTo(x + k, y);
+  c.arcTo(x + w, y, x + w, y + h, k);
+  c.arcTo(x + w, y + h, x, y + h, k);
+  c.arcTo(x, y + h, x, y, k);
+  c.arcTo(x, y, x + w, y, k);
+  c.closePath();
+}
+
+/** 文字绘制（统一入口，测试里能被 fillText 桩记录） */
+function txt(s, x, y, size, color, align, weight, baseline) {
+  ctx.font = (weight || 600) + ' ' + size + 'px -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",system-ui,sans-serif';
+  ctx.fillStyle = color && color[0] === '#' ? color : '#e8eef8';
+  ctx.textAlign = align || 'left';
+  ctx.textBaseline = baseline || 'alphabetic';
+  ctx.fillText(String(s), x, y);
+}
+function withAlpha(x, y, a) { ctx.globalAlpha = a; return () => { ctx.globalAlpha = 1; }; }
+
+/* ═══════════════ 1. 配置 ═══════════════ */
+const STEP = 1 / 120;                    // 固定物理步长
+
+const CFG = {
+  car: { len: 54, wid: 28, r: 15 },
+  /* 4 个前进挡 + R 倒挡。每挡有顶速，油门在挡位内推得动、跨挡推不动 —— 这就是副驾的活 */
+  gears: [95, 178, 262, 335],
+  rpm: { idle: 900, red: 6200, cut: 6400, max: 7400 },
+  shift: { cd: 0.20, perfect: 5100, boost: 1.16, boostDur: 0.75, overRevDecel: 235 },
+  road: { seg: 8, half: 168, verge: 28, angRate: 0.0052 },   // rad/px → 最小转弯半径 ≈192px
+  speed: { max: 335, rev: 110 },
+  accel: 198,
+  drag: 0.25,
+  roll: 8,
+  revAccel: 250,
+  turn: 2.55,
+  turnK: 0.72,          // 极速时转向能力衰减系数（让发夹弯必须减速）
+  brake: { decel: 560, heatUp: 0.62, cool: 0.50, failDur: 1.15, coolFail: 2.6 },
+  grip: { road: 8.5, grass: 3.0, water: 1.55 },
+  fuel: { max: 100, gas: 3.2, idle: 0.55, can: 34, lowPower: 0.55 },
+  crash: { penalty: 1.6, stun: 0.26 },
+  honk: { radius: 165, cd: 0.42 },
+  hornCool: 0.42,
+  partsMax: 420
+};
+
+const DIFFS = {
+  easy:   { key: 'easy',   name: '简单', len: 7600,  halfMul: 1.34, cows: 4,  rocks: 0, puddles: 2, cans: 7, heatOn: false, rain: 0.0, dark: 0.74, limiterDamage: false, hairBias: 0.00 },
+  normal: { key: 'normal', name: '标准', len: 9200,  halfMul: 1.00, cows: 8,  rocks: 3, puddles: 4, cans: 6, heatOn: true,  rain: 0.5, dark: 0.86, hairBias: 0.14 },
+  hard:   { key: 'hard',   name: '困难', len: 10600, halfMul: 0.80, cows: 13, rocks: 5, puddles: 6, cans: 5, heatOn: true,  rain: 1.0, dark: 0.94, hairBias: 0.34 }
+};
+const DIFF_KEYS = ['easy', 'normal', 'hard'];
+
+const PAL = {
+  bg: '#05070c',
+  grass: '#0d1712',
+  grass2: '#0a130f',
+  gravel: '#151a23',
+  road: '#29303e',
+  roadHi: '#2b3241',
+  edge: '#48525f',
+  dash: '#c9a43a',
+  amber: '#ffb347',
+  cyan: '#4fe0d0',
+  red: '#ff5a5a',
+  text: '#e8eef8',
+  dim: 'rgba(232,238,248,.42)'
+};
+
+/* 座位：左边是司机（P1），右边是领航（P2）——键位定义在 readInput() 里 */
+
+/* ═══════════════ 2. 存储 ═══════════════ */
+function store(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
+function load(k, d) { try { const s = localStorage.getItem(k); return s ? JSON.parse(s) : d; } catch (e) { return d; } }
+
+let prefs = load('twinDrive.prefs', { muted: false, volume: 0.8 });
+if (typeof prefs.volume !== 'number') prefs.volume = 0.8;
+let career = load('twinDrive.career', { runs: 0, best: { easy: 0, normal: 0, hard: 0 }, crashes: 0, distance: 0 });
+if (!career.best) career.best = { easy: 0, normal: 0, hard: 0 };
+if (!career.rally) career.rally = { easy: 0, normal: 0, hard: 0 };
+
+/* ═══════════════ 3. 音效（Web Audio 合成，零音频文件） ═══════════════ */
+let actx = null, master = null, muted = !!prefs.muted;
+function AC() {
+  if (!actx) {
+    const A = (typeof window !== 'undefined') && (window.AudioContext || window.webkitAudioContext);
+    if (!A) return null;
+    try {
+      actx = new A();
+      master = actx.createGain();
+      master.gain.value = muted ? 0 : prefs.volume;
+      master.connect(actx.destination);
+    } catch (e) { actx = null; master = null; }
+  }
+  if (actx && actx.state === 'suspended' && actx.resume) actx.resume();
+  return actx;
+}
+function setVolume(v) {
+  prefs.volume = clamp(v, 0, 1);
+  if (master) master.gain.value = muted ? 0 : prefs.volume;
+  store('twinDrive.prefs', prefs);
+}
+function applyMute() { if (master) master.gain.value = muted ? 0 : prefs.volume; }
+
+/** 一段扫频音 */
+function tone(type, f1, f2, dur, vol, delay) {
+  if (muted) return;
+  const a = AC(); if (!a) return;
+  const t0 = a.currentTime + (delay || 0);
+  const o = a.createOscillator(), g = a.createGain();
+  o.type = type || 'sine';
+  o.frequency.setValueAtTime(Math.max(20, f1), t0);
+  if (f2 !== f1) o.frequency.exponentialRampToValueAtTime(Math.max(20, f2), t0 + dur);
+  g.gain.setValueAtTime(0.0001, t0);
+  g.gain.exponentialRampToValueAtTime(Math.max(0.0002, vol), t0 + Math.min(0.02, dur * 0.3));
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  o.connect(g); g.connect(master);
+  o.start(t0); o.stop(t0 + dur + 0.03);
+}
+/** 噪声（刹车、撞击、雨） */
+function noiseBurst(dur, vol, cutoff, delay) {
+  if (muted) return;
+  const a = AC(); if (!a) return;
+  const t0 = a.currentTime + (delay || 0);
+  const n = Math.floor(a.sampleRate * dur);
+  const buf = a.createBuffer(1, n, a.sampleRate);
+  const d = buf.getChannelData(0);
+  for (let i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / n);
+  const src = a.createBufferSource(); src.buffer = buf;
+  const f = a.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = cutoff || 1200;
+  const g = a.createGain();
+  g.gain.setValueAtTime(vol, t0);
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  src.connect(f); f.connect(g); g.connect(master);
+  src.start(t0); src.stop(t0 + dur + 0.02);
+}
+
+/* 引擎：锯齿主音 + 方波低八度 + 二次谐波，频率跟着「转速」走；另外一层风噪跟着车速 */
+let engOsc = null, engOsc2 = null, engOsc3 = null, engGain = null, engFilt = null;
+let windSrc = null, windGain = null, windFilt = null;
+
+function engineStart() {
+  if (engOsc || muted) return;
+  const a = AC(); if (!a) return;
+
+  engGain = a.createGain(); engGain.gain.value = 0.0001;
+  engFilt = a.createBiquadFilter(); engFilt.type = 'lowpass'; engFilt.frequency.value = 780; engFilt.Q.value = 3;
+  engOsc = a.createOscillator(); engOsc.type = 'sawtooth'; engOsc.frequency.value = 48;
+  engOsc2 = a.createOscillator(); engOsc2.type = 'square'; engOsc2.frequency.value = 24;
+  engOsc3 = a.createOscillator(); engOsc3.type = 'triangle'; engOsc3.frequency.value = 96;
+  const g2 = a.createGain(); g2.gain.value = 0.30;
+  const g3 = a.createGain(); g3.gain.value = 0.14;
+  engOsc.connect(engFilt); engOsc2.connect(g2); g2.connect(engFilt); engOsc3.connect(g3); g3.connect(engFilt);
+  engFilt.connect(engGain); engGain.connect(master);
+  engOsc.start(); engOsc2.start(); engOsc3.start();
+
+  /* 风噪：一段循环的低频噪声，滤成"呼呼" */
+  try {
+    const len = Math.floor(a.sampleRate * 2);
+    const buf = a.createBuffer(1, len, a.sampleRate);
+    const d = buf.getChannelData(0);
+    let last = 0;
+    for (let i = 0; i < len; i++) { const w = Math.random() * 2 - 1; last = last * 0.94 + w * 0.06; d[i] = last * 5; }
+    windSrc = a.createBufferSource(); windSrc.buffer = buf; windSrc.loop = true;
+    windFilt = a.createBiquadFilter(); windFilt.type = 'bandpass'; windFilt.frequency.value = 500; windFilt.Q.value = 0.7;
+    windGain = a.createGain(); windGain.gain.value = 0.0001;
+    windSrc.connect(windFilt); windFilt.connect(windGain); windGain.connect(master);
+    windSrc.start();
+  } catch (e) { windSrc = null; }
+}
+
+function engineStop() {
+  if (!engOsc) return;
+  try { engOsc.stop(); engOsc2.stop(); engOsc3.stop(); } catch (e) {}
+  try { if (windSrc) windSrc.stop(); } catch (e) {}
+  engOsc = engOsc2 = engOsc3 = engGain = engFilt = null;
+  windSrc = windGain = windFilt = null;
+}
+
+function engineTick(spd, gas, alive) {
+  if (!actx) return;
+  const t = actx.currentTime;
+  const rpm = (typeof car !== 'undefined' && car) ? car.rpm : 900;
+
+  if (engOsc) {
+    const f = 26 + rpm * 0.0148;               // 900 转 ≈ 39Hz，红线 ≈ 118Hz
+    engOsc.frequency.setTargetAtTime(f, t, 0.05);
+    engOsc2.frequency.setTargetAtTime(f * 0.5, t, 0.05);
+    engOsc3.frequency.setTargetAtTime(f * 2, t, 0.05);
+    engFilt.frequency.setTargetAtTime(420 + rpm * 0.16, t, 0.07);
+
+    let g = alive ? (0.016 + rpm / CFG.rpm.max * 0.055) : 0.0001;
+    /* 顶在限转器上 → 供油被切断的"突突"感 */
+    if (alive && car && car.limiterT > 0.15) g *= 0.62 + 0.38 * Math.sin(t * 78);
+    engGain.gain.setTargetAtTime(g, t, alive ? 0.05 : 0.14);
+  }
+  if (windGain) {
+    const v = Math.min(1, Math.abs(spd) / CFG.speed.max);
+    windGain.gain.setTargetAtTime(alive ? (0.004 + v * v * 0.055) : 0.0001, t, 0.18);
+    windFilt.frequency.setTargetAtTime(360 + v * 1100, t, 0.25);
+  }
+}
+
+const SFX = {
+  crash() { noiseBurst(0.40, 0.55, 760); tone('sine', 150, 44, 0.34, 0.42); tone('square', 90, 40, 0.18, 0.16, 0.02); },
+  horn() { tone('square', 392, 392, 0.14, 0.16); tone('square', 494, 494, 0.14, 0.13, 0.005); tone('square', 392, 392, 0.09, 0.10, 0.20); },
+  pick() { tone('triangle', 720, 1180, 0.13, 0.20); tone('triangle', 1180, 1560, 0.10, 0.10, 0.10); },
+  overheat() { noiseBurst(0.32, 0.22, 3200); tone('sawtooth', 330, 96, 0.30, 0.16); },
+  moo() { tone('sawtooth', 168, 118, 0.42, 0.10); tone('sawtooth', 172, 122, 0.38, 0.06, 0.05); },
+  beep(hi) { tone('square', hi ? 880 : 620, hi ? 880 : 620, 0.10, 0.13); },
+  finish() { tone('triangle', 620, 620, 0.12, 0.15); tone('triangle', 820, 820, 0.12, 0.15, 0.12); tone('triangle', 1040, 1040, 0.26, 0.16, 0.24); },
+  deny() { tone('square', 200, 160, 0.10, 0.12); },
+  skid() { noiseBurst(0.16, 0.09, 2400); },
+  shift(perfect) {
+    noiseBurst(0.07, 0.10, 900);
+    if (perfect) { tone('triangle', 880, 1320, 0.10, 0.13); tone('triangle', 1320, 1320, 0.08, 0.07, 0.09); }
+    else tone('square', 220, 180, 0.06, 0.07);
+  },
+  badShift() { tone('square', 130, 92, 0.16, 0.13); noiseBurst(0.10, 0.06, 500); }
+};
+
+/* ═══════════════ 4. 全局状态 ═══════════════ */
+let state = 'menu';            // menu | countdown | playing | paused | stageOver | result
+let runMode = 'single';        // single | rally
+let stageIdx = 0;
+const STAGE_COUNT = 3;
+let rally = { times: [], seedBase: 0 };
+const STAGE_NAMES = ['夜路', '夜雨', '浓雾'];
+const STAGE_MODS = [
+  { rain: 0.35, dark: 0.84 },
+  { rain: 1.00, dark: 0.90 },
+  { rain: 0.20, dark: 0.99 }
+];
+let menuMode = 1;              // 菜单里选中的模式：0=单段 1=拉力三段
+let stageCardT = 0;
+
+/* 幽灵车：每 1/40 秒记一个 [x, y, 朝向×100, 里程]，只在"同一条赛道"上回放 */
+const GHOST_HZ = 40;
+let ghost = null;              // { seed, time, pts: [] , visible }
+let ghostRec = null;
+let ghostTick = 0;
+let ghostDelta = 0;            // 与幽灵的里程差（米），正=领先
+let addMarkNow = 0;            // 调试：?mark=40 直接放一个领航标记
+let marks = [];                // 领航在手机上打的标记 { s, life }
+let prevState = 'menu';
+let diffName = 'normal';
+let D = DIFFS.normal;
+let menuSel = 1;               // 难度选择（0/1/2）
+let pauseSel = 0;
+let gameTime = 0;
+let cdT = 0;
+let runSeed = 0;
+let track = null;
+let car = null;
+let cam = { x: 0, y: 0, shake: 0 };
+let stats = { time: 0, crashes: 0, honks: 0, overheats: 0, bestS: 0, fuelUsed: 0, brakeTime: 0, gasTime: 0, shifts: 0, perfect: 0, limiterTime: 0 };
+let cows = [], rocks = [], cans = [], zones = [], parts = [], partPool = [];
+let result = null;
+let toastMsg = '', toastT = 0;
+let skids = [];
+let hornCd = 0, beepStep = 0;
+const SPLITS = [0.25, 0.5, 0.75];
+let splitIdx = 0;
+
+/* ═══════════════ 5. 赛道生成 ═══════════════ */
+/**
+ * 赛道 = 一条"永远向北（y 递减）"的折线，所以 x = f(y) 是单值函数：
+ *   · 永不自交，小地图和进度换算都是线性的
+ *   · 采样点固定 8px 一个，靠 y 就能 O(1) 定位到附近
+ * 曲率靠 slope（dx/dy）一阶平滑控制，避免出现司机打不过来的急弯。
+ */
+/**
+ * 段落选择。sgn（弯向）不是纯随机：横向跑太远就强制往回收，
+ * 否则"别越跑越远"那条回中逻辑会把发夹弯的目标斜率削平，急弯全是假的。
+ */
+function pickSec(rng, diff, closing, x) {
+  const r = rng();
+  const sgn = x > 320 ? -1 : (x < -320 ? 1 : (rng() < 0.5 ? -1 : 1));
+  if (closing) return { kind: 'straight', n: 24 + rng() * 26 };
+  if (r < 0.24) {
+    /* 难度不只是"更多障碍"：困难档的直道有 1/3 的几率被改成发夹弯 */
+    if (diff.hairBias && rng() < diff.hairBias) return { kind: 'hairpin', n: 44 + rng() * 26, sgn };
+    return { kind: 'straight', n: 30 + rng() * 38 };
+  }
+  if (r < 0.52) return { kind: 'gentle', n: 52 + rng() * 46, sgn };
+  if (r < 0.72) return { kind: 'chicane', n: 84 + rng() * 44, sgn };
+  if (r < 0.86) return { kind: 'hairpin', n: 46 + rng() * 24, sgn };
+  if (r < 0.92) return { kind: 'switchback', n: 62 + rng() * 26, sgn };
+  if (r < 0.96) return { kind: 'narrow', n: 44 + rng() * 34, sgn };
+  return { kind: 'bridge', n: 36 + rng() * 24, sgn };
+}
+
+function genTrack(seed, dname) {
+  const diff = DIFFS[dname] || DIFFS.normal;
+  const rng = mulberry32((seed >>> 0) || 1);
+  const SEG = CFG.road.seg;
+  const baseHalf = CFG.road.half * diff.halfMul;
+
+  const pts = [], half = [], rails = [];
+  let x = 0, slope = 0, target = 0, rate = 0.030;
+  let targetHalf = baseHalf, curHalf = baseHalf;
+  let railNow = false, total = 0, i = 0;
+
+  let sec = null, secI = 0;
+  const maxPts = Math.ceil((diff.len * 1.6) / SEG) + 200;
+
+  while (total < diff.len && i < maxPts) {
+    if (!sec || secI >= sec.n) {
+      sec = pickSec(rng, diff, total > diff.len - 780, x);
+      secI = 0;
+      if (sec.kind === 'chicane' || sec.kind === 'switchback') sec.flip = 0;
+      if (sec.kind === 'hairpin') rate = 0.115;
+      else if (sec.kind === 'switchback') rate = 0.090;
+      else if (sec.kind === 'chicane') rate = 0.045;
+      else rate = 0.028;
+      /* 发夹弯外沿上护栏：不减速就撞（简单档除外，给新手留条活路） */
+      railNow = sec.kind === 'bridge' || (sec.kind === 'hairpin' && diff.key !== 'easy');
+      if (sec.kind === 'narrow') targetHalf = baseHalf * 0.66;
+      else if (sec.kind === 'bridge') targetHalf = baseHalf * 0.62;
+      else if (sec.kind === 'hairpin') targetHalf = baseHalf * 0.58;
+      else if (sec.kind === 'switchback') targetHalf = baseHalf * 0.64;
+      else targetHalf = baseHalf * (sec.kind === 'gentle' ? 1.04 : 0.98);
+    }
+
+    // 每段的期望斜率
+    switch (sec.kind) {
+      case 'straight': target = 0.06 * Math.sin(i * 0.05); break;
+      case 'gentle':   target = sec.sgn * 0.62; break;
+      case 'chicane':
+        if (secI % 26 === 0) sec.flip = -sec.flip;
+        target = (sec.flip || 1) * 0.95 * sec.sgn;
+        break;
+      case 'hairpin':  target = sec.sgn * 2.45; break;
+      case 'switchback':
+        if (secI % 30 === 0) sec.flip = -sec.flip;
+        target = (sec.flip || 1) * 2.05;
+        break;
+      default:         target = sec.sgn * 0.34; break;
+    }
+    // 别越跑越远：横向偏太多就往回拉
+    if (Math.abs(x) > 900) target *= 0.5;
+
+    /* 直接限制「每像素转多少弧度」而不是限制斜率变化率：
+       斜率空间里 cos²θ 会放大转角，导致转角处出现 R<100px 的假发夹弯（路面自交）。
+       统一按角速度限速 → 全赛道曲率半径 ≥ 190px。 */
+    const maxD = CFG.road.angRate * SEG * (1 + slope * slope);
+    slope += clamp(target - slope, -Math.min(rate, maxD), Math.min(rate, maxD));
+    slope = clamp(slope, -2.7, 2.7);
+    x += slope * SEG;
+    curHalf = approach(curHalf, targetHalf, 1.6);
+
+    pts.push({ x, y: -i * SEG });
+    half.push(curHalf);
+    rails.push(railNow ? 1 : 0);
+
+    if (i > 0) total += Math.hypot(SEG, (slope) * SEG);
+    i++; secI++;
+  }
+
+  // 终点前把斜率收敛到 0（注意：不能直接把点拽向终点，会拉出 70° 以上的斜切）
+  const n = pts.length;
+  const TAIL = Math.min(40, n - 2);
+  let tl = (pts[n - TAIL].x - pts[n - TAIL - 1].x) / SEG;
+  for (let k = n - TAIL + 1; k < n; k++) {
+    tl = approach(tl, 0, 0.09);
+    pts[k].x = pts[k - 1].x + tl * SEG;
+  }
+
+  // 法线 + 累计里程
+  const nx = [], ny = [], dist = [0];
+  for (let k = 0; k < n; k++) {
+    const a = pts[Math.max(0, k - 1)], b = pts[Math.min(n - 1, k + 1)];
+    const dx = b.x - a.x, dy = b.y - a.y;
+    const L = Math.hypot(dx, dy) || 1;
+    nx.push(-dy / L); ny.push(dx / L);
+    if (k > 0) dist.push(dist[k - 1] + Math.hypot(pts[k].x - pts[k - 1].x, pts[k].y - pts[k - 1].y));
+  }
+
+  /* 末段拉直 / 角速度限速都会让实际弧长比目标短，缺多少补多少（补成直道，正好当终点直道） */
+  let tailX = pts[pts.length - 1].x;
+  let tailHalf = half[half.length - 1];
+  let g2 = 0;
+  while (dist[dist.length - 1] < diff.len && g2++ < 4000) {
+    const k = pts.length;
+    pts.push({ x: tailX, y: -k * SEG });
+    half.push(tailHalf);
+    rails.push(0);
+    nx.push(1); ny.push(0);
+    dist.push(dist[dist.length - 1] + SEG);
+  }
+
+  const tr = {
+    seed: (seed >>> 0) || 1, diff: diff.key, seg: SEG,
+    pts, half, nx, ny, rails, dist, total: dist[dist.length - 1],
+    baseHalf, obstacles: [], zones: [], cows: [], cans: [], haz: [], rng
+  };
+
+  /* ── 路边障碍（树 / 石头） ── */
+  for (let k = 60; k < n - 70; k += 2) {
+    for (const side of [-1, 1]) {
+      const h = hash2(k, side > 0 ? 11 : 29);
+      if (h > 0.42) continue;
+      const off = tr.half[k] + 56 + h * 250;
+      tr.obstacles.push({
+        kind: h < 0.30 ? 'tree' : 'rock',
+        i: k,
+        x: pts[k].x + nx[k] * off * side,
+        y: pts[k].y + ny[k] * off * side,
+        r: h < 0.30 ? 21 : 15,
+        s: h
+      });
+    }
+  }
+  // 按采样下标分桶：渲染时只画视野内的
+  tr.obsByI = new Array(n);
+  for (const o of tr.obstacles) {
+    if (!tr.obsByI[o.i]) tr.obsByI[o.i] = [];
+    tr.obsByI[o.i].push(o);
+  }
+
+  /* ── 危险物 / 道具 ── */
+  const place = (s, offFrac) => {
+    const p = sampleAt(tr, s);
+    return {
+      s, off: p.half * offFrac,
+      x: p.x + p.nx * p.half * offFrac,
+      y: p.y + p.ny * p.half * offFrac,
+      half: p.half
+    };
+  };
+
+  for (let k = 0; k < diff.rocks; k++) {
+    const s0 = rr(rng, 900, Math.max(1200, tr.total - 1000));
+    tr.zones.push({ kind: 'rock', s0, s1: s0 + rr(rng, 320, 520), next: rr(rng, 0.5, 1.2), warn: null });
+  }
+  for (let k = 0; k < diff.puddles; k++) {
+    const s0 = rr(rng, 600, Math.max(900, tr.total - 600));
+    tr.zones.push({ kind: 'puddle', s0, s1: s0 + rr(rng, 120, 220), frac: rr(rng, -0.62, 0.62) });
+  }
+  for (let k = 0; k < diff.cows; k++) {
+    const pos = place(rr(rng, 500, Math.max(800, tr.total - 500)), rr(rng, -0.55, 0.55));
+    tr.cows.push({
+      s: pos.s, off: pos.off, x: pos.x, y: pos.y,
+      vx: rr(rng, -16, 16), scared: 0, alive: true, a: rr(rng, -0.4, 0.4), moo: 0
+    });
+  }
+  for (let k = 1; k <= diff.cans; k++) {
+    const pos = place(tr.total * (k / (diff.cans + 1)) + rr(rng, -140, 140), rr(rng, -0.62, 0.62));
+    tr.cans.push({ s: pos.s, x: pos.x, y: pos.y, taken: false, bob: rng() * TAU });
+  }
+
+  // 小地图标记：[s, kind] 0=牛 1=落石区 2=油桶 3=急弯 4=终点
+  for (const w of tr.cows) tr.haz.push([w.s, 0]);
+  for (const z of tr.zones) if (z.kind === 'rock') tr.haz.push([z.s0, 1]);
+  for (const c of tr.cans) tr.haz.push([c.s, 2]);
+  /* 急弯标记：同一个弯只报一次（否则连续几个采样点会刷出一串红圈） */
+  let lastCurve = -1e9;
+  for (let k = 40; k < n - 40; k += 4) {
+    const a1 = Math.atan2(pts[k + 4].x - pts[k - 4].x, -(pts[k + 4].y - pts[k - 4].y));
+    const a0 = Math.atan2(pts[k - 10].x - pts[k - 18].x, -(pts[k - 10].y - pts[k - 18].y));
+    if (Math.abs(angDiff(a0, a1)) > 0.30 && tr.dist[k] - lastCurve > 300) {
+      tr.haz.push([tr.dist[k], 3]);
+      lastCurve = tr.dist[k];
+    }
+  }
+  tr.haz.push([tr.total, 4]);
+  tr.haz.sort((a, b) => a[0] - b[0]);
+
+  return tr;
+}
+
+/** 二分找 s 对应的采样下标 */
+function idxAtS(tr, s) {
+  const d = tr.dist, last = d.length - 1;
+  if (s <= 0) return 0;
+  if (s >= d[last]) return last;
+  let lo = 0, hi = last;
+  while (lo + 1 < hi) {
+    const mid = (lo + hi) >> 1;
+    if (d[mid] <= s) lo = mid; else hi = mid;
+  }
+  return lo;
+}
+
+function sampleAt(tr, s) {
+  const i = idxAtS(tr, s);
+  const j = Math.min(i + 1, tr.pts.length - 1);
+  const span = tr.dist[j] - tr.dist[i];
+  const t = span > 1e-6 ? clamp((s - tr.dist[i]) / span, 0, 1) : 0;
+  const a = tr.pts[i], b = tr.pts[j];
+  /* 终点之后 i === j，切线要退一格取，否则 atan2(0, -0) 会算出 π（整条末段曲率爆炸） */
+  let tx = b.x - a.x, ty = b.y - a.y;
+  if (tx === 0 && ty === 0) {
+    const c0 = tr.pts[Math.max(0, i - 1)];
+    tx = a.x - c0.x; ty = a.y - c0.y;
+  }
+  return {
+    i, x: lerp(a.x, b.x, t), y: lerp(a.y, b.y, t),
+    angle: (tx === 0 && ty === 0) ? 0 : Math.atan2(tx, -ty),
+    half: lerp(tr.half[i], tr.half[j], t),
+    nx: tr.nx[i], ny: tr.ny[i],
+    rail: tr.rails[i]
+  };
+}
+
+/** 找车到赛道中心线的最近点（局部窗口搜，120Hz 也够快） */
+function nearestOnTrack(tr, x, y) {
+  const n = tr.pts.length;
+  const i0 = clamp(Math.round(-y / tr.seg), 0, n - 1);
+  const a = Math.max(0, i0 - 36), b = Math.min(n - 1, i0 + 36);
+  let best = Infinity, bi = i0;
+  for (let k = a; k <= b; k++) {
+    const d = dist2(x, y, tr.pts[k].x, tr.pts[k].y);
+    if (d < best) { best = d; bi = k; }
+  }
+  return { i: bi, d: Math.sqrt(best), s: tr.dist[bi], half: tr.half[bi], rail: tr.rails[bi] };
+}
+
+/* ═══════════════ 6. 车 ═══════════════ */
+function makeCar(tr) {
+  const p = sampleAt(tr, 60);
+  return {
+    x: p.x, y: p.y, a: p.angle, vx: 0, vy: 0, vf: 0, spd: 0,
+    heat: 0, brakeFail: 0, fuel: CFG.fuel.max, stun: 0, wet: 0,
+    s: 60, i: p.i, offroad: false, steer: 0, honkCd: 0, dust: 0, inv: 0, stuckT: 0,
+    gear: 1, rpm: 900, shiftCd: 0, boostT: 0, limiterT: 0, prevUp: 0, prevDown: 0,
+    jolt: 0, shiftFlash: 0, cutT: 0
+  };
+}
+
+/** 车头能转多快（乘上 CFG.turn 就是 rad/s）；速度越快越钝 */
+function turnFactor(v) {
+  const sp = Math.abs(v);
+  const rel = clamp(sp / CFG.speed.max, 0, 1);
+  return clamp(sp / 150, 0, 1) * (1 - CFG.turnK * Math.pow(rel, 1.5));
+}
+
+/** 领航在手机上点了一下：在「前方 m 米」的路上立一个标记 */
+function addMark(meters) {
+  if (!track || !car) return;
+  const m = clamp(Number(meters) || 0, 0, 300);
+  const s = Math.min(track.total - 20, car.s + m * 12);
+  marks.push({ s, life: 9 });
+  if (marks.length > 6) marks.shift();
+  toast('领航标记 · 前方 ' + Math.round((s - car.s) / 12) + ' 米', PAL.cyan);
+  SFX.pick();
+}
+
+/** 给定路径曲率（rad/px），这辆车能安全通过的最高车速——二分反解 v·κ = ω(v) */
+function safeSpeed(kappa) {
+  if (!(kappa > 0.0008)) return CFG.speed.max;
+  let lo = 24, hi = CFG.speed.max;
+  for (let i = 0; i < 16; i++) {
+    const v = (lo + hi) / 2;
+    if (v * kappa > CFG.turn * turnFactor(v)) hi = v; else lo = v;
+  }
+  return lo;
+}
+
+/** 前方 span 像素的路径曲率 */
+function curvatureAt(tr, s, span) {
+  const a0 = sampleAt(tr, s).angle;
+  const a1 = sampleAt(tr, s + span).angle;
+  return Math.abs(angDiff(a0, a1)) / span;
+}
+
+/**
+ * 街机化单车模型：
+ *   速度拆成"沿车头"和"侧向"两个分量，侧向用抓地力衰减 → 转向时轻微漂移
+ *   车头旋转不改变速度方向 → 这就是"甩尾"的来源
+ */
+function stepCar(dt, ctl) {
+  const c = car;
+  if (c.stun > 0) c.stun = Math.max(0, c.stun - dt);
+  if (c.honkCd > 0) c.honkCd = Math.max(0, c.honkCd - dt);
+  if (c.wet > 0) c.wet = Math.max(0, c.wet - dt);
+  if (c.inv > 0) c.inv = Math.max(0, c.inv - dt);
+
+  const power = c.fuel >= 20 ? 1 : CFG.fuel.lowPower + (1 - CFG.fuel.lowPower) * (c.fuel / 20);
+  const gas = (!c.stun && ctl.gas) ? 1 : 0;
+  let brake = (!c.stun && ctl.brake) ? 1 : 0;
+
+  if (brake) stats.brakeTime += dt;
+  if (gas) stats.gasTime += dt;
+
+  /* 刹车温度：一直踩着会过热失灵，逼两个人喊节奏 */
+  if (brake && Math.abs(c.vf) > 24 && D.heatOn) {
+    c.heat = clamp(c.heat + CFG.brake.heatUp * dt, 0, 1);
+    if (c.heat >= 1 && c.brakeFail <= 0) {
+      c.brakeFail = CFG.brake.failDur;
+      stats.overheats++;
+      SFX.overheat();
+      toast('刹车过热 · 松一下', PAL.red);
+      hint('heat', '刹车别一直踩 · 脉冲式点刹降温快', PAL.red);
+    }
+  } else {
+    c.heat = clamp(c.heat - CFG.brake.cool * dt, 0, 1);
+  }
+  if (c.brakeFail > 0) {
+    c.brakeFail = Math.max(0, c.brakeFail - dt);
+    c.heat = clamp(c.heat - CFG.brake.coolFail * dt, 0, 1);
+    brake = 0;
+  }
+
+  /* 油量：只削弱动力，永不彻底抛锚 */
+  c.fuel = clamp(c.fuel - (gas ? CFG.fuel.gas : CFG.fuel.idle) * dt, 0, CFG.fuel.max);
+  stats.fuelUsed = CFG.fuel.max - c.fuel;
+
+  /* 转向：低速打不动方向；接近极速时转向不足（转弯半径 95px@200 → 290px@335） */
+  const turnScale = turnFactor(c.vf);
+  c.steer = clamp(ctl.steer, -1, 1);
+  c.a += c.steer * CFG.turn * turnScale * dt * (c.vf >= 0 ? 1 : -1);
+  c.a = (c.a + TAU * 2) % TAU;
+
+  const fx = Math.sin(c.a), fy = -Math.cos(c.a);
+  const rx = Math.cos(c.a), ry = Math.sin(c.a);
+  let vf = c.vx * fx + c.vy * fy;
+  let vr = c.vx * rx + c.vy * ry;
+
+  /* ── 变速箱：P2 的活。油门的推力只在本挡顶速内有效 ── */
+  if (c.shiftCd > 0) c.shiftCd = Math.max(0, c.shiftCd - dt);
+  if (c.boostT > 0) c.boostT = Math.max(0, c.boostT - dt);
+  if (c.jolt > 0) c.jolt = Math.max(0, c.jolt - dt);
+  if (c.shiftFlash > 0) c.shiftFlash = Math.max(0, c.shiftFlash - dt);
+  if (c.cutT > 0) c.cutT = Math.max(0, c.cutT - dt);
+  const wUp = ctl.up ? 1 : 0, wDown = ctl.down ? 1 : 0;
+  if (wUp && !c.prevUp) shift(1);
+  if (wDown) shift(-1);
+  c.prevUp = wUp; c.prevDown = wDown;
+
+  const gm = gearMax(c.gear);
+  const rel = clamp(Math.abs(vf) / gm, 0, 1.8);
+  c.rpm = clamp(CFG.rpm.idle + rel * (CFG.rpm.red - CFG.rpm.idle), 320, CFG.rpm.max);
+
+  let pw = 1;
+  if (c.rpm < 1600) pw = 0.45;                        // 拖挡：高一挡低速没劲
+  else if (c.rpm >= CFG.rpm.cut) pw = 0.55;           // 断油区（还在推，但推不动）
+  if (c.rpm >= CFG.rpm.max * 0.99) pw = 0;
+  if (c.boostT > 0) pw *= CFG.shift.boost;            // 完美换挡的短促推力
+  if (c.cutT > 0) pw *= 0.25;                         // 换挡时那一下离合切断
+
+  /* 顶在红区不走 → 引擎保护，功率掉到 60%（逼副驾按时升档）。
+     注意只在 1~3 挡算：4 挡顶速本来就压在红线上，不该罚。 */
+  const atLimiter = c.gear > 0 && c.gear < 4 && c.rpm >= CFG.rpm.red - 20;
+  if (atLimiter) { c.limiterT = Math.min(5, c.limiterT + dt); stats.limiterTime += dt; }
+  else c.limiterT = Math.max(0, c.limiterT - dt * 1.8);
+  if (c.limiterT > 2.2 && D.limiterDamage !== false) pw *= 0.6;
+  if (atLimiter) hint('shift', '转速到红区了 · 让副驾按 ↑ 升挡', PAL.amber);
+
+  /* 超转（抢挡减速）：转速超红线就是发动机在帮你刹车 */
+  if (c.rpm > CFG.rpm.cut) vf = approach(vf, 0, CFG.shift.overRevDecel * dt);
+
+  const road = nearestOnTrack(track, c.x, c.y);
+  c.i = road.i; c.s = Math.max(0, road.s);
+  const offroad = road.d > road.half - 4;
+  c.offroad = offroad;
+  const gripK = offroad ? CFG.grip.grass : (c.wet > 0 ? CFG.grip.water : CFG.grip.road);
+
+  const dir = c.gear === 0 ? -1 : 1;                 // R 挡油门=往后退
+  if (gas) vf += dir * CFG.accel * pw * power * dt;
+  vf -= vf * CFG.drag * dt;
+  vf = approach(vf, 0, CFG.roll * dt);
+  if (brake) vf = approach(vf, 0, CFG.brake.decel * dt);
+
+  /* 挡位顶速：不换挡就上不去 */
+  const gearVmax = gm * (0.70 + 0.30 * power);
+  if (c.gear === 0) vf = clamp(vf, -gearVmax, 6);
+  else {
+    vf = Math.min(vf, gearVmax);
+    if (offroad) vf = Math.min(vf, gearVmax * 0.55);
+    vf = Math.max(vf, -10);
+  }
+  if (offroad) vf *= Math.exp(-2.7 * dt);
+  vr *= Math.exp(-gripK * dt);
+
+  c.vx = fx * vf + rx * vr;
+  c.vy = fy * vf + ry * vr;
+  c.x += c.vx * dt;
+  c.y += c.vy * dt;
+  c.vf = vf;
+  c.slip = Math.abs(vr);
+  c.spd = Math.hypot(c.vx, c.vy);
+
+  /* 护栏：桥/窄路冲出边界算撞墙。
+     注意不要每帧 "vf *= -0.28" 地反弹——那样车会被钉在护栏上原地蹭（实测过），
+     正确做法是把「朝向护栏」的那部分速度减掉，只留沿墙分量。 */
+  if (road.rail && road.d > road.half + 6) {
+    const p = sampleAt(track, road.s);
+    const side = ((c.x - p.x) * p.nx + (c.y - p.y) * p.ny) > 0 ? 1 : -1;
+    c.x = p.x + p.nx * (road.half + 4) * side;
+    c.y = p.y + p.ny * (road.half + 4) * side;
+    const wallX = p.nx * side, wallY = p.ny * side;
+    const vn = c.vx * wallX + c.vy * wallY;
+    if (vn > 0) { c.vx -= vn * wallX * 1.35; c.vy -= vn * wallY * 1.35; }
+    c.vf = c.vx * Math.sin(c.a) - c.vy * Math.cos(c.a);
+    c.spd = Math.hypot(c.vx, c.vy);
+    crash({ x: c.x, y: c.y, r: 0, kind: 'rail' });
+  }
+
+  /* 撞击：路边的树/石头（无敌帧内穿过，避免连撞） */
+  if (c.inv <= 0) for (let k = 0; k < track.obstacles.length; k++) {
+    const o = track.obstacles[k];
+    if (o.y > c.y + 70 || o.y < c.y - 70) continue;
+    if (dist2(c.x, c.y, o.x, o.y) < (o.r + CFG.car.r) * (o.r + CFG.car.r)) { crash(o); break; }
+  }
+  /* 撞牛 */
+  if (c.inv <= 0) for (const w of cows) {
+    if (!w.alive) continue;
+    if (Math.abs(w.x - c.x) < 40 && Math.abs(w.y - c.y) < 40 && dist2(c.x, c.y, w.x, w.y) < 34 * 34) {
+      crash({ x: w.x, y: w.y, r: 19, kind: 'cow' });
+      w.scared = 0.9;
+      SFX.moo();
+      break;
+    }
+  }
+  /* 撞落石（已经撞碎的不再挡路） */
+  if (c.inv <= 0) for (const rk of rocks) {
+    if (rk.hit || rk.t < 0.85) continue;
+    if (dist2(c.x, c.y, rk.x, rk.y) < (rk.r + CFG.car.r) * (rk.r + CFG.car.r)) {
+      crash(rk); rk.hit = true; break;
+    }
+  }
+  /* 水坑 */
+  for (const z of zones) {
+    if (z.kind !== 'puddle') continue;
+    if (c.s < z.s0 - 40 || c.s > z.s1 + 40) continue;
+    const p = sampleAt(track, clamp(c.s, z.s0, z.s1));
+    if (dist2(c.x, c.y, p.x + p.nx * p.half * z.frac, p.y + p.ny * p.half * z.frac) < 60 * 60) {
+      if (c.wet <= 0.05) SFX.skid();
+      c.wet = Math.max(c.wet, 0.9);
+    }
+  }
+  /* 加油桶 */
+  for (const can of cans) {
+    if (can.taken) continue;
+    if (Math.abs(can.s - c.s) > 60) continue;
+    if (dist2(c.x, c.y, can.x, can.y) < 46 * 46) {
+      can.taken = true;
+      c.fuel = Math.min(CFG.fuel.max, c.fuel + CFG.fuel.can);
+      SFX.pick();
+      burst(can.x, can.y, 10, PAL.amber, 90, 0.45, 2.5);
+      toast('+油', PAL.amber);
+    }
+  }
+
+  /* 安全网①：卡在树丛里出不来（真人也会遇到）→ 1.6s 后拖回路面 */
+  if (Math.abs(vf) < 25) c.stuckT += dt; else c.stuckT = 0;
+  if (c.stuckT > 1.1) hint('stuck', '卡住了 · 副驾按住 ↓ 挂 R，再踩油门倒出来', PAL.amber);
+  const wedged = c.stuckT > 1.6 && road.d > road.half + 18;
+  /* 安全网②：彻底迷路 */
+  if (wedged || road.d > road.half + 380) rescueCar(road.s);
+
+  /* 侧滑：留胎痕 + 胎噪（转向不足的时候真的会滑） */
+  c.markCd = (c.markCd || 0) - dt;
+  if (c.slip > 38 && Math.abs(vf) > 70 && c.markCd <= 0) {
+    c.markCd = 0.045;
+    const bx = -fx * 17, by = -fy * 17;
+    const lx = Math.cos(c.a) * 12, ly = Math.sin(c.a) * 12;
+    skids.push({ x: c.x + bx + lx, y: c.y + by + ly, a: c.a, life: 2.6, w: 4.4 });
+    skids.push({ x: c.x + bx - lx, y: c.y + by - ly, a: c.a, life: 2.6, w: 4.4 });
+    while (skids.length > 320) skids.shift();
+  }
+  c.skidCd = (c.skidCd || 0) - dt;
+  if (c.slip > 70 && Math.abs(vf) > 130 && c.skidCd <= 0) { c.skidCd = 0.26; SFX.skid(); }
+
+  /* 油门/失控的视觉粒子 */
+  c.dust -= dt;
+  if (offroad && Math.abs(vf) > 60 && c.dust <= 0) {
+    c.dust = 0.055;
+    const bxp = c.x - fx * 24, byp = c.y - fy * 24;
+    burst(bxp, byp, 2, '#6b6250', 40, 0.5, 2.2);
+  }
+
+  /* 分段计时：每 1/4 报一次相对基准的差值，让两个人中途也有目标感 */
+  if (splitIdx < SPLITS.length && c.s >= track.total * SPLITS[splitIdx]) {
+    const t = stats.time + stats.crashes * CFG.crash.penalty;
+    const par = track.total / 295 + 3.5;
+    const delta = t - par * SPLITS[splitIdx];
+    stats.splits.push({ at: SPLITS[splitIdx], time: t, delta });
+    toast((delta <= 0 ? '分段 ' + fmtTime(t) + '  快 ' + (-delta).toFixed(1) + 's'
+                     : '分段 ' + fmtTime(t) + '  慢 ' + delta.toFixed(1) + 's'),
+          delta <= 0 ? PAL.cyan : PAL.red);
+    splitIdx++;
+  }
+
+  // 进度只增不减
+  if (c.s > stats.bestS) stats.bestS = c.s;
+  if (c.honkCd <= 0 && ctl.horn) honk();
+
+  /* 冲线 */
+  if (c.s >= track.total - 30) finishRun();
+}
+
+/**
+ * 撞车不是"原地僵住"：给一小段无敌帧 + 沿法线反弹 + 往路中心拽一把。
+ * 否则贴着树的玩家会陷入 0.4s 一次的无限连撞（这是实测踩出来的坑）。
+ */
+/** 当前挡位的顶速（0 = R 倒挡） */
+function gearMax(g) { return g === 0 ? CFG.speed.rev : CFG.gears[clamp(g, 1, CFG.gears.length) - 1]; }
+
+/**
+ * 换挡。升挡时如果转速落在「完美区间」会给一小段推力加成——
+ * 换早了没劲、换晚了断油，时机是两个人吵起来的地方。
+ */
+function shift(delta) {
+  const c = car;
+  if (!c || c.shiftCd > 0) return;
+  const next = clamp(c.gear + delta, 0, 4);
+  if (next === c.gear) { c.shiftCd = 0.12; return; }
+  if (next === 0 && Math.abs(c.vf) > 16) {
+    toast('停稳才能挂 R', PAL.red);
+    c.shiftCd = 0.5;
+    return;
+  }
+  const perfect = delta > 0 && c.gear > 0 && c.rpm >= CFG.shift.perfect && c.rpm <= CFG.rpm.max;
+  c.gear = next;
+  c.shiftCd = CFG.shift.cd;
+  stats.shifts++;
+
+  /* 换挡手感：机身顿一下 + 排气 + 仪表闪。普通换挡有 0.1s 离合切断，完美换挡没有 */
+  c.jolt = 0.30;
+  c.shiftFlash = 0.45;
+  if (!perfect) c.cutT = 0.10;
+  cam.kick = Math.max(cam.kick || 0, 0.7);
+  const fx = Math.sin(c.a), fy = -Math.cos(c.a);
+  burst(c.x - fx * 26, c.y - fy * 26, 5, '#7f8794', 46, 0.32, 2.3);
+
+  if (perfect) {
+    c.boostT = CFG.shift.boostDur;
+    stats.perfect++;
+    toast('完美换挡', PAL.cyan);
+    SFX.shift(true);
+    hint('perfect', '漂亮 · 红线前那一下就是完美换挡');
+  } else {
+    SFX.shift(false);
+    if (delta > 0 && c.rpm < 3000) { SFX.badShift(); hint('early', '换早了 · 转速到红区再升，不然没劲'); }
+  }
+}
+
+function crash(o) {
+  const c = car;
+  if (c.inv > 0) return;
+  c.inv = 0.95;
+  c.stun = CFG.crash.stun;
+  stats.crashes++;
+  stats.kinds = stats.kinds || {};
+  const kk = (o && o.kind) || 'x';
+  stats.kinds[kk] = (stats.kinds[kk] || 0) + 1;
+  cam.shake = 1;
+  SFX.crash();
+
+  let dx = c.x - o.x, dy = c.y - o.y;
+  let d = Math.hypot(dx, dy);
+  if (d < 1e-3) { dx = -Math.sin(c.a); dy = Math.cos(c.a); d = 1; }
+  const nx2 = dx / d, ny2 = dy / d;
+
+  /* 速度沿法线反射并衰减 */
+  const vn = c.vx * nx2 + c.vy * ny2;
+  if (vn < 0) { c.vx -= 2 * vn * nx2; c.vy -= 2 * vn * ny2; }
+  c.vx *= 0.42; c.vy *= 0.42;
+  c.vf = c.vx * Math.sin(c.a) - c.vy * Math.cos(c.a);
+
+  /* 推开 + 朝路中心挪 */
+  const need = (o.r + CFG.car.r + 3) - d;
+  if (need > 0) { c.x += nx2 * need; c.y += ny2 * need; }
+  const rd = nearestOnTrack(track, c.x, c.y);
+  const cp = track.pts[rd.i];
+  const tx = cp.x - c.x, ty = cp.y - c.y;
+  const tl = Math.hypot(tx, ty) || 1;
+  const pull = Math.min(26, tl);
+  c.x += (tx / tl) * pull;
+  c.y += (ty / tl) * pull;
+
+  burst(c.x, c.y, 12, PAL.amber, 110, 0.5, 3);
+
+  /* 同一个地方连撞 4 次 → 判定为卡死，直接拖回路面（否则会永动连撞） */
+  if (c.lastCrashS !== undefined && Math.abs(c.s - c.lastCrashS) < 90) c.streak = (c.streak || 0) + 1;
+  else c.streak = 1;
+  c.lastCrashS = c.s;
+  if (c.streak >= 4) rescueCar(c.s);
+}
+
+/** 把车拖回中心线（休闲向：不惩罚"卡住"，只惩罚"撞了"） */
+function rescueCar(s) {
+  const c = car;
+  const p = sampleAt(track, s);
+  c.x = p.x; c.y = p.y; c.a = p.angle;
+  c.vx = 0; c.vy = 0; c.vf = 0; c.spd = 0;
+  c.stuckT = 0; c.streak = 0; c.inv = Math.max(c.inv, 1.2);
+  toast('拖回赛道', PAL.cyan);
+}
+
+function honk() {
+  const c = car;
+  c.honkCd = CFG.hornCool;
+  stats.honks++;
+  SFX.horn();
+  let scared = 0;
+  for (const w of cows) {
+    if (!w.alive || w.scared > 0) continue;
+    if (dist2(c.x, c.y, w.x, w.y) < CFG.honk.radius * CFG.honk.radius) { w.scared = 1.6; scared++; }
+  }
+  if (scared) toast('牛被吓跑了', PAL.cyan);
+}
+
+/* ═══════════════ 7. 危险物更新 ═══════════════ */
+function updateHazards(dt) {
+  const c = car;
+
+  /* 牛：在路面上慢慢晃，被吓到就往路外跑 */
+  for (const w of cows) {
+    if (!w.alive) continue;
+    if (w.scared > 0) {
+      w.scared -= dt;
+      w.off += (w.off >= 0 ? 1 : -1) * 120 * dt;
+      if (w.scared <= 0) w.alive = false;
+    } else {
+      if (Math.abs(w.s - c.s) < 1400) {
+        w.off += w.vx * dt;
+        const p = sampleAt(track, w.s);
+        const lim = p.half * 0.86;
+        if (Math.abs(w.off) > lim) { w.vx *= -1; w.off = clamp(w.off, -lim, lim); }
+        w.a += Math.sin(gameTime * 1.6 + w.s) * 0.6 * dt;
+      }
+    }
+    const p = sampleAt(track, w.s);
+    w.x = p.x + p.nx * w.off;
+    w.y = p.y + p.ny * w.off;
+  }
+
+  /* 落石区：先在地面投影 0.85s，再砸下来变成障碍 */
+  for (const z of zones) {
+    if (z.kind !== 'rock') continue;
+    if (c.s > z.s1 + 240 || c.s < z.s0 - 2400) { z.warn = null; continue; }
+    if (z.warn) {
+      z.warn.t += dt;
+      if (z.warn.t >= 0.85) {
+        rocks.push({ x: z.warn.x, y: z.warn.y, r: 17, t: 0, i: z.warn.i, vx: 0, vy: 0, kind: 'rock' });
+        z.warn = null;
+        z.next = rr(track.rng, 0.9, 1.8);
+      }
+    } else {
+      z.next -= dt;
+      if (z.next <= 0 && c.s >= z.s0 - 300) {
+        /* 只在"至少 330px 之外"落石，否则会连着砸在同一辆车上（实测踩过） */
+        const s = clamp(c.s + 380 + track.rng() * 480, z.s0, z.s1);
+        if (s >= c.s + 330) {
+          const p = sampleAt(track, s);
+          const off = (track.rng() * 2 - 1) * p.half * 0.62;
+          z.warn = { x: p.x + p.nx * off, y: p.y + p.ny * off, t: 0, i: p.i };
+        } else {
+          z.next = 0.5;
+        }
+      }
+    }
+  }
+  for (let k = rocks.length - 1; k >= 0; k--) {
+    const rk = rocks[k];
+    if (rk.t < 1) rk.t = Math.min(1, rk.t + dt * 3.6);
+    if (rk.hit) {
+      rk.gone = (rk.gone || 0) + dt;
+      if (rk.gone > 0.35) rocks.splice(k, 1);
+    }
+  }
+
+  /* 油桶上下浮动（纯视觉） */
+  for (const can of cans) can.bob += dt * 2;
+
+  updateParts(dt);
+  for (let k = marks.length - 1; k >= 0; k--) {
+    marks[k].life -= dt;
+    if (marks[k].life <= 0) marks.splice(k, 1);
+  }
+  for (let k = skids.length - 1; k >= 0; k--) {
+    skids[k].life -= dt;
+    if (skids[k].life <= 0) skids.splice(k, 1);
+  }
+  if (cam.shake > 0) cam.shake = Math.max(0, cam.shake - dt * 2.6);
+  if (cam.kick > 0) cam.kick = Math.max(0, cam.kick - dt * 5.5);
+}
+
+/* ═══════════════ 8. 粒子 ═══════════════ */
+function newPart() { return partPool.length ? partPool.pop() : {}; }
+function burst(x, y, n, color, spd, life, size) {
+  for (let k = 0; k < n; k++) {
+    if (parts.length >= CFG.partsMax) return;
+    const p = newPart();
+    const a = Math.random() * TAU, v = spd * (0.35 + Math.random() * 0.8);
+    p.x = x; p.y = y; p.vx = Math.cos(a) * v; p.vy = Math.sin(a) * v;
+    p.life = p.maxLife = life * (0.6 + Math.random() * 0.7);
+    p.size = size * (0.6 + Math.random() * 0.8);
+    p.color = color; p.fade = 1;
+    parts.push(p);
+  }
+}
+function updateParts(dt) {
+  for (let k = parts.length - 1; k >= 0; k--) {
+    const p = parts[k];
+    p.life -= dt;
+    if (p.life <= 0) {
+      parts.splice(k, 1);
+      if (partPool.length < 500) partPool.push(p);
+      continue;
+    }
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    p.vx *= 0.94; p.vy *= 0.94;
+  }
+}
+
+function toast(msg, color) { toastMsg = msg; toastT = 2.2; toastColor = color || PAL.text; }
+let toastColor = PAL.text;
+
+/** 只在"第一次遇到"时弹一次的教学提示（记在 career.hints 里，跨局持久） */
+function hint(key, msg, color) {
+  if (!career.hints) career.hints = {};
+  if (career.hints[key]) return;
+  career.hints[key] = 1;
+  store('twinDrive.career', career);
+  toast(msg, color || PAL.cyan);
+}
+/* ═══════════════ 9. 开局 / 冲线 ═══════════════ */
+function stageWeather() {
+  const base = DIFFS[diffName];
+  if (runMode !== 'rally') return base;
+  const m = STAGE_MODS[Math.min(stageIdx, STAGE_MODS.length - 1)] || STAGE_MODS[0];
+  return Object.assign({}, base, { rain: m.rain, dark: m.dark });
+}
+
+function ghostKey(seed) { return 'twinDrive.ghost.' + seed; }
+
+/** 开局：把这条赛道的幽灵读出来（种子不同就不显示） */
+function ghostLoad() {
+  ghost = null; ghostRec = []; ghostTick = 0; ghostDelta = 0;
+  const g = load(ghostKey(runSeed), null);
+  if (g && g.pts && g.pts.length >= 24) {
+    ghost = { seed: g.seed, time: g.time, pts: g.pts, visible: true };
+  }
+}
+
+/** 冲线：比幽灵快才存（每局都录，存的是最好的一次） */
+function ghostSave(total) {
+  if (!ghostRec || ghostRec.length < 90) return;
+  const key = ghostKey(runSeed);
+  const prev = load(key, null);
+  if (prev && prev.time <= total) return;
+  store(key, { seed: runSeed, time: +total.toFixed(2), ts: Date.now(), pts: ghostRec });
+  ghostPrune();
+}
+
+/** 别让 localStorage 无限长大：最多留 12 条幽灵 */
+function ghostPrune() {
+  try {
+    const keys = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.indexOf('twinDrive.ghost.') === 0) {
+        let ts = 0;
+        try { ts = (JSON.parse(localStorage.getItem(k)) || {}).ts || 0; } catch (e) {}
+        keys.push({ k, ts });
+      }
+    }
+    if (keys.length <= 12) return;
+    keys.sort((a, b) => a.ts - b.ts);
+    for (let i = 0; i < keys.length - 12; i++) localStorage.removeItem(keys[i].k);
+  } catch (e) {}
+}
+
+/** 当前时刻幽灵在哪 */
+function ghostAt(t) {
+  if (!ghost || !ghost.visible || !ghost.pts) return null;
+  const n = ghost.pts.length / 4;
+  if (n < 2) return null;
+  const f = clamp(t * GHOST_HZ, 0, n - 1.001);
+  const i0 = Math.floor(f), fr = f - i0, i1 = Math.min(n - 1, i0 + 1);
+  const p = ghost.pts;
+  return {
+    x: lerp(p[i0 * 4], p[i1 * 4], fr),
+    y: lerp(p[i0 * 4 + 1], p[i1 * 4 + 1], fr),
+    a: lerp(p[i0 * 4 + 2], p[i1 * 4 + 2], fr) / 100,
+    s: lerp(p[i0 * 4 + 3], p[i1 * 4 + 3], fr)
+  };
+}
+
+function startRun(seed, dname) {
+  AC();
+  runMode = 'single';            // 低层入口默认单段；拉力由 startStage 再改回来
+  if (dname) diffName = DIFFS[dname] ? dname : diffName;
+  D = DIFFS[diffName];
+  runSeed = (seed === undefined || seed === null) ? ((Math.random() * 1e9) | 0) : (seed | 0);
+  D = stageWeather();
+  track = genTrack(runSeed, diffName);
+  car = makeCar(track);
+  cows = track.cows; cans = track.cans; zones = track.zones;
+  rocks = [];
+  parts.length = 0;
+  partPool.length = 0;
+  stats = { time: 0, crashes: 0, honks: 0, overheats: 0, bestS: 0, fuelUsed: 0, brakeTime: 0, gasTime: 0, splits: [], shifts: 0, perfect: 0, limiterTime: 0 };
+  splitIdx = 0;
+  skids.length = 0;
+  marks.length = 0;
+  cam.x = car.x - W / 2;
+  cam.y = car.y - H * 0.66;
+  cam.shake = 0;
+  state = 'countdown';
+  cdT = AUTO ? 0.02 : 2.2;
+  beepStep = 0;
+  result = null;
+  toastMsg = ''; toastT = 0;
+  engineStop();
+  autoMem.stuck = 0; autoMem.rev = 0; autoMem.cool = 0; autoMem.lastS = 0;
+  ghostLoad();
+  lanSendTrack();
+}
+
+function startRally(seedBase) {
+  const base = (seedBase === undefined || seedBase === null) ? ((Math.random() * 1e9) | 0) : (seedBase | 0);
+  rally = { times: [], seedBase: base };
+  stageIdx = 0;
+  startStage();
+}
+
+function startStage() {
+  const seed = (rally.seedBase + stageIdx * 7919) | 0;
+  startRun(seed, diffName);
+  runMode = 'rally';
+  D = stageWeather();
+  toast('赛段 ' + (stageIdx + 1) + '/' + STAGE_COUNT + ' · ' + STAGE_NAMES[stageIdx], PAL.cyan);
+}
+
+function finishRun() {
+  if (state !== 'playing') return;
+  const pen = stats.crashes * CFG.crash.penalty;
+  const total = stats.time + pen;
+  const par = track.total / 295 + 3.5;
+  const stars = total <= par ? 3 : total <= par * 1.18 ? 2 : total <= par * 1.45 ? 1 : 0;
+  const rec = {
+    time: stats.time, penalty: pen, total, par, stars,
+    crashes: stats.crashes, honks: stats.honks, overheats: stats.overheats,
+    brakeTime: stats.brakeTime, gasTime: stats.gasTime,
+    shifts: stats.shifts, perfect: stats.perfect, limiterTime: stats.limiterTime,
+    diff: diffName, seed: runSeed, dist: track.total,
+    name: STAGE_NAMES[stageIdx] || ''
+  };
+
+  ghostSave(total);          // 单段/拉力都用本段时间存幽灵
+  career.runs = (career.runs || 0) + 1;
+  career.crashes = (career.crashes || 0) + stats.crashes;
+  career.distance = (career.distance || 0) + track.total;
+
+  if (runMode === 'rally') {
+    rally.times.push(rec);
+    if (stageIdx < STAGE_COUNT - 1) {
+      stageIdx++;
+      state = 'stageOver';
+      stageCardT = 0;
+      SFX.finish();
+      engineStop();
+      store('twinDrive.career', career);
+      return;
+    }
+    const sum = (k) => rally.times.reduce((a, b) => a + (b[k] || 0), 0);
+    const rtotal = sum('total'), rpar = sum('par');
+    const rstars = rtotal <= rpar ? 3 : rtotal <= rpar * 1.18 ? 2 : rtotal <= rpar * 1.45 ? 1 : 0;
+    if (!career.rally) career.rally = { easy: 0, normal: 0, hard: 0 };
+    const prev = career.rally[diffName] || 0;
+    const isBest = !prev || rtotal < prev;
+    if (isBest) career.rally[diffName] = rtotal;
+    store('twinDrive.career', career);
+    result = {
+      rally: true, stages: rally.times.slice(),
+      time: sum('time'), penalty: sum('penalty'), total: rtotal, par: rpar, stars: rstars,
+      best: isBest, prevBest: prev,
+      crashes: sum('crashes'), honks: sum('honks'), overheats: sum('overheats'),
+      brakeTime: sum('brakeTime'), gasTime: sum('gasTime'),
+      shifts: sum('shifts'), perfect: sum('perfect'), limiterTime: sum('limiterTime'),
+      diff: diffName, seed: rally.seedBase, dist: sum('dist')
+    };
+    state = 'result';
+    SFX.finish();
+    engineStop();
+    return;
+  }
+
+  const prevBest = career.best[diffName] || 0;
+  const isBest = !prevBest || total < prevBest;
+  if (isBest) career.best[diffName] = total;
+  store('twinDrive.career', career);
+  result = Object.assign(rec, { best: isBest, prevBest });
+  state = 'result';
+  SFX.finish();
+  engineStop();
+}
+
+/* ═══════════════ 10. 相机 ═══════════════ */
+function updateCamera(dt) {
+  const tx = car.x - W / 2 + car.vx * 0.10;
+  const ty = car.y - H * 0.66 + car.vy * 0.10;
+  const k = 1 - Math.exp(-9 * dt);
+  cam.x += (tx - cam.x) * k;
+  cam.y += (ty - cam.y) * k;
+}
+
+function viewRange() {
+  const seg = track.seg, last = track.pts.length - 1;
+  const i0 = clamp(Math.floor(-(cam.y + H + 140) / seg), 0, last);
+  const i1 = clamp(Math.ceil(-(cam.y - 140) / seg), 0, last);
+  return [i0, i1];
+}
+
+/* ═══════════════ 11. 世界渲染 ═══════════════ */
+let grassPat = null;
+function makeGrassPattern() {
+  let c;
+  try { c = document.createElement('canvas'); } catch (e) { return; }
+  c.width = c.height = 96;
+  const g = c.getContext('2d');
+  if (!g || !g.fillRect) return;
+  g.fillStyle = PAL.grass; g.fillRect(0, 0, 96, 96);
+  for (let k = 0; k < 60; k++) {
+    g.fillStyle = 'rgba(180,255,200,' + (0.006 + Math.random() * 0.016) + ')';
+    g.fillRect(Math.random() * 96, Math.random() * 96, 1 + Math.random() * 6, 1 + Math.random() * 2);
+  }
+  for (let k = 0; k < 24; k++) {
+    g.fillStyle = 'rgba(0,0,0,' + (0.03 + Math.random() * 0.05) + ')';
+    g.beginPath(); g.arc(Math.random() * 96, Math.random() * 96, 3 + Math.random() * 9, 0, TAU); g.fill();
+  }
+  try { grassPat = ctx.createPattern(c, 'repeat'); } catch (e) { grassPat = null; }
+}
+
+function drawGrass() {
+  ctx.fillStyle = PAL.grass2;
+  ctx.fillRect(cam.x - 40, cam.y - 40, W + 80, H + 80);
+  if (grassPat) {
+    ctx.fillStyle = grassPat;
+    ctx.fillRect(cam.x - 40, cam.y - 40, W + 80, H + 80);
+  }
+}
+
+/** 把一段赛道画成闭合多边形（左岸正向 + 右岸反向），可加宽 */
+function roadPoly(i0, i1, pad) {
+  ctx.beginPath();
+  for (let k = i0; k <= i1; k++) {
+    const p = track.pts[k], w = track.half[k] + pad;
+    const X = p.x + track.nx[k] * w, Y = p.y + track.ny[k] * w;
+    if (k === i0) ctx.moveTo(X, Y); else ctx.lineTo(X, Y);
+  }
+  for (let k = i1; k >= i0; k--) {
+    const p = track.pts[k], w = track.half[k] + pad;
+    ctx.lineTo(p.x - track.nx[k] * w, p.y - track.ny[k] * w);
+  }
+  ctx.closePath();
+}
+
+function roadEdge(i0, i1, side, pad) {
+  ctx.beginPath();
+  for (let k = i0; k <= i1; k++) {
+    const p = track.pts[k], w = (track.half[k] + pad) * side;
+    const X = p.x + track.nx[k] * w, Y = p.y + track.ny[k] * w;
+    if (k === i0) ctx.moveTo(X, Y); else ctx.lineTo(X, Y);
+  }
+  ctx.stroke();
+}
+
+function drawRoad() {
+  const [i0, i1] = viewRange();
+
+  /* 碎石路肩 */
+  roadPoly(i0, i1, CFG.road.verge);
+  ctx.fillStyle = PAL.gravel; ctx.fill();
+
+  /* 护栏（窄桥段） */
+  ctx.strokeStyle = 'rgba(150,162,178,.5)';
+  ctx.lineWidth = 3.2;
+  let run = -1;
+  for (let k = i0; k <= i1 + 1; k++) {
+    const on = k <= i1 && track.rails[k];
+    if (on && run < 0) run = k;
+    if ((!on || k === i1) && run >= 0) {
+      roadEdge(run, k, 1, 3); roadEdge(run, k, -1, 3);
+      run = -1;
+    }
+  }
+
+  /* 沥青 */
+  roadPoly(i0, i1, 0);
+  ctx.fillStyle = PAL.road; ctx.fill();
+
+  /* 车辙：沿赛车线两条略暗的带，路面立刻有"被跑过"的痕迹 */
+  ctx.strokeStyle = 'rgba(0,0,0,.14)';
+  ctx.lineWidth = 50;
+  for (const side of [-1, 1]) {
+    ctx.beginPath();
+    for (let k = i0; k <= i1; k++) {
+      const p = track.pts[k], w = 44 * side;
+      const X = p.x + track.nx[k] * w, Y = p.y + track.ny[k] * w;
+      if (k === i0) ctx.moveTo(X, Y); else ctx.lineTo(X, Y);
+    }
+    ctx.stroke();
+  }
+
+  /* 路肩碎石点 */
+  for (let k = i0; k <= i1; k += 3) {
+    for (const side of [-1, 1]) {
+      const h = hash2(k, side > 0 ? 131 : 137);
+      if (h > 0.45) continue;
+      const p = track.pts[k];
+      const w = (track.half[k] + 4 + h * 22) * side;
+      ctx.fillStyle = 'rgba(140,150,165,.16)';
+      ctx.fillRect(p.x + track.nx[k] * w, p.y + track.ny[k] * w, 2, 2);
+    }
+  }
+
+  /* 中线虚线 */
+  ctx.strokeStyle = 'rgba(201,164,58,.5)';
+  ctx.lineWidth = 2.4;
+  ctx.beginPath();
+  for (let k = i0; k <= i1; k += 4) {
+    const a = track.pts[k], b = track.pts[Math.min(i1, k + 2)];
+    ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y);
+  }
+  ctx.stroke();
+
+  /* 边线 */
+  ctx.strokeStyle = 'rgba(120,132,150,.35)';
+  ctx.lineWidth = 2.2;
+  roadEdge(i0, i1, 1, -3); roadEdge(i0, i1, -1, -3);
+
+  /* 反光路桩：夜路上真正看得见的东西 */
+  for (let k = i0; k <= i1; k += 12) {
+    const p = track.pts[k];
+    for (const side of [-1, 1]) {
+      const w = (track.half[k] + 12) * side;
+      const gx = p.x + track.nx[k] * w, gy = p.y + track.ny[k] * w;
+      ctx.fillStyle = k % 24 === 0 ? 'rgba(255,214,150,.85)' : 'rgba(210,225,245,.55)';
+      ctx.fillRect(gx - 1.6, gy - 1.6, 3.2, 3.2);
+    }
+  }
+
+  /* 终点线 */
+  const endI = track.pts.length - 4;
+  if (endI >= i0 - 4 && endI <= i1 + 4) {
+    const p = track.pts[endI];
+    ctx.save();
+    ctx.translate(p.x, p.y);
+    ctx.rotate(Math.atan2(track.pts[endI + 1].x - p.x, -(track.pts[endI + 1].y - p.y)));
+    const hw = track.half[endI];
+    for (let gx = -hw; gx < hw; gx += 20) {
+      const c = (Math.round((gx + hw) / 20) % 2) ? '#d8dfea' : '#12161d';
+      ctx.fillStyle = c;
+      ctx.fillRect(gx, -10, 20, 20);
+    }
+    ctx.restore();
+  }
+}
+
+function drawObstacle(o) {
+  if (o.kind === 'tree') {
+    ctx.fillStyle = 'rgba(0,0,0,.38)';
+    ctx.beginPath(); ctx.ellipse(o.x + 7, o.y + 9, o.r * 1.02, o.r * 0.76, 0, 0, TAU); ctx.fill();
+    ctx.fillStyle = '#16301f';
+    ctx.beginPath(); ctx.arc(o.x, o.y, o.r, 0, TAU); ctx.fill();
+    ctx.fillStyle = '#1e4029';
+    ctx.beginPath(); ctx.arc(o.x - o.r * 0.34, o.y - o.r * 0.36, o.r * 0.64, 0, TAU); ctx.fill();
+    ctx.fillStyle = '#265334';
+    ctx.beginPath(); ctx.arc(o.x - o.r * 0.48, o.y - o.r * 0.52, o.r * 0.30, 0, TAU); ctx.fill();
+  } else {
+    ctx.fillStyle = 'rgba(0,0,0,.4)';
+    ctx.beginPath(); ctx.ellipse(o.x + 5, o.y + 6, o.r * 1.05, o.r * 0.8, 0, 0, TAU); ctx.fill();
+    ctx.fillStyle = '#3c424e';
+    ctx.beginPath();
+    ctx.moveTo(o.x - o.r, o.y + o.r * 0.5);
+    ctx.lineTo(o.x - o.r * 0.55, o.y - o.r * 0.8);
+    ctx.lineTo(o.x + o.r * 0.35, o.y - o.r);
+    ctx.lineTo(o.x + o.r, o.y + o.r * 0.2);
+    ctx.lineTo(o.x + o.r * 0.4, o.y + o.r * 0.85);
+    ctx.closePath(); ctx.fill();
+    ctx.fillStyle = 'rgba(255,255,255,.10)';
+    ctx.beginPath(); ctx.arc(o.x - o.r * 0.2, o.y - o.r * 0.35, o.r * 0.36, 0, TAU); ctx.fill();
+  }
+}
+
+function drawDecor() {
+  const [i0, i1] = viewRange();
+  for (let k = i0; k <= i1; k++) {
+    const bucket = track.obsByI[k];
+    if (bucket) for (let j = 0; j < bucket.length; j++) drawObstacle(bucket[j]);
+    /* 草丛（纯装饰，不挡路） */
+    if ((k & 1) === 0) {
+      for (const side of [-1, 1]) {
+        const h = hash2(k, side > 0 ? 71 : 97);
+        if (h > 0.30) continue;
+        const p = track.pts[k];
+        const off = (track.half[k] + 22 + h * 220) * side;
+        const gx = p.x + track.nx[k] * off, gy = p.y + track.ny[k] * off;
+        ctx.strokeStyle = 'rgba(70,120,86,.35)';
+        ctx.lineWidth = 1.4;
+        ctx.beginPath();
+        for (let b = 0; b < 3; b++) {
+          ctx.moveTo(gx + b * 3 - 3, gy + 3);
+          ctx.lineTo(gx + b * 3 - 3 + (h - 0.5) * 6, gy - 4 - b);
+        }
+        ctx.stroke();
+      }
+    }
+  }
+}
+
+function drawCows() {
+  for (const w of cows) {
+    if (!w.alive) continue;
+    ctx.save();
+    ctx.translate(w.x, w.y);
+    ctx.rotate(w.a);
+    ctx.fillStyle = 'rgba(0,0,0,.42)';
+    ctx.beginPath(); ctx.ellipse(4, 6, 19, 13, 0, 0, TAU); ctx.fill();
+    ctx.fillStyle = '#3a2f27';
+    ctx.beginPath(); ctx.ellipse(0, 0, 18, 11.5, 0, 0, TAU); ctx.fill();
+    ctx.fillStyle = '#5a4b3d';
+    ctx.beginPath(); ctx.ellipse(-2, -2, 11, 7, 0, 0, TAU); ctx.fill();
+    ctx.fillStyle = '#e9e2d4';
+    ctx.beginPath(); ctx.ellipse(-5, 1, 6, 5, 0.4, 0, TAU); ctx.fill();
+    ctx.fillStyle = '#2b231d';
+    ctx.beginPath(); ctx.arc(15, 0, 6.2, 0, TAU); ctx.fill();
+    ctx.strokeStyle = '#cfc3ac'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(18, -4); ctx.lineTo(22, -8); ctx.moveTo(18, 4); ctx.lineTo(22, 8); ctx.stroke();
+    ctx.restore();
+  }
+}
+
+function drawCans() {
+  for (const can of cans) {
+    if (can.taken) continue;
+    const bob = Math.sin(can.bob) * 1.6;
+    ctx.fillStyle = 'rgba(0,0,0,.4)';
+    ctx.beginPath(); ctx.ellipse(can.x + 3, can.y + 9, 12, 6, 0, 0, TAU); ctx.fill();
+    ctx.save();
+    ctx.translate(can.x, can.y + bob);
+    ctx.fillStyle = 'rgba(255,179,71,.16)';
+    ctx.beginPath(); ctx.arc(0, 0, 22, 0, TAU); ctx.fill();
+    ctx.fillStyle = '#ffb347';
+    roundRect(ctx, -9, -12, 18, 24, 4); ctx.fill();
+    ctx.fillStyle = '#3a2a10';
+    ctx.fillRect(-9, -3, 18, 6);
+    ctx.fillStyle = 'rgba(255,255,255,.5)';
+    ctx.fillRect(-6, -9, 3, 14);
+    ctx.restore();
+  }
+}
+
+function drawRocks() {
+  for (const rk of rocks) {
+    if (rk.hit) continue;
+    const t = rk.t;
+    if (t < 0.85) continue;
+    const sc = 0.4 + (t - 0.85) * 3.2;
+    ctx.fillStyle = 'rgba(0,0,0,.45)';
+    ctx.beginPath(); ctx.ellipse(rk.x + 4, rk.y + 6, rk.r * sc, rk.r * sc * 0.8, 0, 0, TAU); ctx.fill();
+    ctx.fillStyle = '#4a505c';
+    ctx.beginPath();
+    ctx.moveTo(rk.x - rk.r * sc, rk.y + rk.r * 0.5 * sc);
+    ctx.lineTo(rk.x - rk.r * 0.5 * sc, rk.y - rk.r * 0.9 * sc);
+    ctx.lineTo(rk.x + rk.r * 0.4 * sc, rk.y - rk.r * sc);
+    ctx.lineTo(rk.x + rk.r * sc, rk.y + rk.r * 0.3 * sc);
+    ctx.lineTo(rk.x + rk.r * 0.3 * sc, rk.y + rk.r * 0.9 * sc);
+    ctx.closePath(); ctx.fill();
+  }
+  /* 落石预警：地面上的阴影 + 收缩的圈 */
+  for (const z of zones) {
+    if (z.kind !== 'rock' || !z.warn) continue;
+    const w = z.warn, t = clamp(w.t / 0.85, 0, 1);
+    ctx.save();
+    ctx.translate(w.x, w.y);
+    ctx.strokeStyle = 'rgba(255,90,90,' + (0.25 + t * 0.6) + ')';
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(0, 0, lerp(46, 18, t), 0, TAU); ctx.stroke();
+    ctx.fillStyle = 'rgba(0,0,0,.35)';
+    ctx.beginPath(); ctx.arc(0, 0, 18 * (0.6 + t * 0.4), 0, TAU); ctx.fill();
+    ctx.restore();
+  }
+}
+
+function drawPuddles() {
+  for (const z of zones) {
+    if (z.kind !== 'puddle') continue;
+    const a = sampleAt(track, z.s0), b = sampleAt(track, z.s1);
+    const x1 = a.x + a.nx * a.half * z.frac, y1 = a.y + a.ny * a.half * z.frac;
+    const x2 = b.x + b.nx * b.half * z.frac, y2 = b.y + b.ny * b.half * z.frac;
+    ctx.strokeStyle = 'rgba(96,150,190,.34)';
+    ctx.lineWidth = 34;
+    ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+    ctx.lineCap = 'butt';
+  }
+}
+
+function drawSkids() {
+  if (!skids.length) return;
+  ctx.fillStyle = '#0b0e14';
+  for (let k = 0; k < skids.length; k++) {
+    const m = skids[k];
+    ctx.globalAlpha = clamp(m.life / 2.6, 0, 1) * 0.45;
+    ctx.save();
+    ctx.translate(m.x, m.y);
+    ctx.rotate(m.a);
+    ctx.fillRect(-m.w / 2, -3.2, m.w, 6.4);
+    ctx.restore();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawMarks() {
+  for (let i = 0; i < marks.length; i++) {
+    const mk = marks[i];
+    const p = sampleAt(track, mk.s);
+    const x = p.x - cam.x, y = p.y - cam.y;
+    if (x < -60 || x > W + 60 || y < -60 || y > H + 60) continue;
+    const a = Math.min(1, mk.life / 1.2);
+    const pulse = 0.5 + 0.5 * Math.sin(gameTime * 7);
+    ctx.globalAlpha = 0.55 * a;
+    ctx.strokeStyle = PAL.cyan;
+    ctx.lineWidth = 2.4;
+    ctx.beginPath(); ctx.arc(x, y, 10 + pulse * 10, 0, TAU); ctx.stroke();
+    ctx.globalAlpha = 0.25 * a;
+    ctx.fillStyle = PAL.cyan;
+    ctx.beginPath(); ctx.arc(x, y, 8 + pulse * 10, 0, TAU); ctx.fill();
+    ctx.globalAlpha = 0.95 * a;
+    ctx.fillRect(x - 1.2, y - 30, 2.4, 30);
+    ctx.beginPath(); ctx.arc(x, y - 32, 4.6, 0, TAU); ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(x - 7.5, y - 37); ctx.lineTo(x + 7.5, y - 37); ctx.lineTo(x, y - 45);
+    ctx.closePath(); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawGhostCar() {
+  if (!ghost || !ghost.visible) return;
+  const g = ghostAt(stats.time);
+  if (!g) return;
+  const sx = g.x - cam.x, sy = g.y - cam.y;
+  if (sx < 30 || sx > W - 30 || sy < 30 || sy > H - 30) return;   // 出画面交给边缘箭头
+  ctx.save();
+  ctx.translate(sx, sy);
+  ctx.rotate(g.a);
+  ctx.globalAlpha = 0.16;
+  ctx.fillStyle = '#4fe0d0';
+  roundRect(ctx, -CFG.car.wid / 2 - 4, -CFG.car.len / 2 - 4, CFG.car.wid + 8, CFG.car.len + 8, 10);
+  ctx.fill();
+  ctx.globalAlpha = 0.42;
+  roundRect(ctx, -CFG.car.wid / 2, -CFG.car.len / 2, CFG.car.wid, CFG.car.len, 8);
+  ctx.fill();
+  ctx.globalAlpha = 0.85;
+  ctx.fillStyle = 'rgba(220,255,250,.9)';
+  ctx.fillRect(-7, -CFG.car.len / 2 + 3, 14, 3);
+  ctx.restore();
+  ctx.globalAlpha = 1;
+}
+
+/** 幽灵在画面外时，在屏幕边缘画一个指向它的小三角（画在 HUD 之后，不会被盖住） */
+function drawGhostEdge() {
+  if (!ghost || !ghost.visible) return;
+  const g = ghostAt(stats.time);
+  if (!g) return;
+  const sx = g.x - cam.x, sy = g.y - cam.y;
+  if (sx >= 30 && sx <= W - 30 && sy >= 30 && sy <= H - 30) return;
+  const ex = clamp(sx, 24, W - 24), ey = clamp(sy, 24, H - 24);
+  const ang = Math.atan2(sy - H / 2, sx - W / 2);
+  ctx.save();
+  ctx.translate(ex, ey);
+  ctx.rotate(ang);
+  ctx.globalAlpha = 0.62;
+  ctx.fillStyle = '#4fe0d0';
+  ctx.beginPath();
+  ctx.moveTo(14, 0); ctx.lineTo(-9, -9); ctx.lineTo(-9, 9);
+  ctx.closePath(); ctx.fill();
+  ctx.restore();
+  ctx.globalAlpha = 1;
+}
+
+function drawParts() {
+  for (let k = 0; k < parts.length; k++) {
+    const p = parts[k];
+    const a = clamp(p.life / p.maxLife, 0, 1);
+    ctx.globalAlpha = a * 0.85;
+    ctx.fillStyle = p.color;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.size * (0.4 + a * 0.8), 0, TAU); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+/* ═══════════════ 12. 灯光 ═══════════════ */
+function drawLamps() {
+  const [vi0, vi1] = viewRange();
+  ctx.globalCompositeOperation = 'lighter';
+  for (let k = Math.ceil(vi0 / 112) * 112; k <= vi1; k += 112) {
+    const p = track.pts[k];
+    const side = ((k / 112) & 1) ? 1 : -1;
+    const w = (track.half[k] + 62) * side;
+    const gx = p.x + track.nx[k] * w, gy = p.y + track.ny[k] * w;
+    const sx1 = gx - cam.x, sy1 = gy - cam.y;
+    if (sx1 < -120 || sx1 > W + 120 || sy1 < -120 || sy1 > H + 120) continue;
+    const lg = ctx.createRadialGradient(sx1, sy1, 2, sx1, sy1, 118);
+    lg.addColorStop(0, 'rgba(255,206,140,.36)');
+    lg.addColorStop(0.35, 'rgba(255,170,90,.12)');
+    lg.addColorStop(1, 'rgba(255,150,60,0)');
+    ctx.fillStyle = lg;
+    ctx.beginPath(); ctx.arc(sx1, sy1, 118, 0, TAU); ctx.fill();
+    ctx.fillStyle = 'rgba(255,232,190,.92)';
+    ctx.beginPath(); ctx.arc(sx1, sy1, 2.3, 0, TAU); ctx.fill();
+  }
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+function drawLights() {
+  const sx = car.x - cam.x, sy = car.y - cam.y;
+  const R1 = 420 + (1 - D.dark) * 720;
+
+  /* 夜色：multiply 径向渐变，越远越黑 */
+  const g = ctx.createRadialGradient(sx, sy, 30, sx, sy, R1);
+  g.addColorStop(0, 'rgba(255,255,255,1)');
+  g.addColorStop(0.34, 'rgba(236,239,246,1)');
+  g.addColorStop(0.62, 'rgba(118,126,144,1)');
+  g.addColorStop(0.84, 'rgba(38,43,56,1)');
+  g.addColorStop(1, 'rgba(10,12,18,1)');
+  ctx.globalCompositeOperation = 'multiply';
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+  ctx.globalCompositeOperation = 'source-over';
+
+  /* 雨 */
+  if (D.rain > 0) {
+    const n = Math.round(30 + D.rain * 150);
+    ctx.strokeStyle = 'rgba(150,180,210,.16)';
+    ctx.lineWidth = 1.1;
+    ctx.beginPath();
+    for (let k = 0; k < n; k++) {
+      const h = hash2(k, 43);
+      const px = (h * 1.7 * W + gameTime * (620 + h * 300)) % (W + 120) - 60;
+      const py = (h * 1.3 * H + gameTime * (900 + h * 500)) % (H + 120) - 60;
+      ctx.moveTo(px, py); ctx.lineTo(px - 5, py + 22);
+    }
+    ctx.stroke();
+  }
+
+  /* 车灯：两道锥形光 */
+  const fx = Math.sin(car.a), fy = -Math.cos(car.a);
+  const rx = Math.cos(car.a), ry = Math.sin(car.a);
+  const hx = car.x - fx * 22, hy = car.y - fy * 22;
+  const beamLen = D.rain > 0.6 ? 400 : 470;
+  ctx.globalCompositeOperation = 'lighter';
+  for (const side of [-1, 1]) {
+    const ox = rx * 9 * side, oy = ry * 9 * side;
+    const spread = 132;
+    const gb = ctx.createLinearGradient(hx, hy, hx + fx * beamLen, hy + fy * beamLen);
+    gb.addColorStop(0, 'rgba(255,216,155,.50)');
+    gb.addColorStop(0.45, 'rgba(255,198,124,.17)');
+    gb.addColorStop(1, 'rgba(255,180,90,0)');
+    ctx.fillStyle = gb;
+    ctx.beginPath();
+    ctx.moveTo(hx + ox - rx * 7, hy + oy - ry * 7);
+    ctx.lineTo(hx + fx * beamLen + rx * spread * side + ox, hy + fy * beamLen + ry * spread * side + oy);
+    ctx.lineTo(hx + fx * beamLen - rx * 26 * side + ox, hy + fy * beamLen - ry * 26 * side + oy);
+    ctx.lineTo(hx + ox + rx * 7, hy + oy + ry * 7);
+    ctx.closePath(); ctx.fill();
+  }
+  drawLamps();
+
+  /* 高速速度线：只在 76% 极速以上出现，很淡 */
+  const vfrac = Math.abs(car.vf) / CFG.speed.max;
+  if (vfrac > 0.76) {
+    const a0 = (vfrac - 0.76) / 0.24;
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.strokeStyle = 'rgba(190,215,255,' + (a0 * 0.10).toFixed(3) + ')';
+    ctx.lineWidth = 1.4;
+    ctx.beginPath();
+    const fwd = Math.atan2(-Math.cos(car.a), Math.sin(car.a));   // 屏幕上的前进方向
+    for (let k = 0; k < 18; k++) {
+      const h1 = hash2(k, 401), h2 = hash2(k, 409);
+      const ang = fwd + (h1 - 0.5) * 2.5;                          // 只画前方 ±71°
+      const rad = 215 + h2 * 190 + ((gameTime * (210 + h1 * 260)) % 180);
+      const len = 40 + 110 * a0;
+      const x1 = sx + Math.cos(ang) * rad, y1 = sy + Math.sin(ang) * rad;
+      ctx.moveTo(x1, y1);
+      ctx.lineTo(x1 + Math.cos(ang) * len, y1 + Math.sin(ang) * len);
+    }
+    ctx.stroke();
+    ctx.globalCompositeOperation = 'source-over';
+  }
+
+  /* 车身周围的暖光 */
+  const gg = ctx.createRadialGradient(sx, sy, 4, sx, sy, 150);
+  gg.addColorStop(0, 'rgba(255,190,120,.16)');
+  gg.addColorStop(1, 'rgba(255,170,90,0)');
+  ctx.fillStyle = gg;
+  ctx.beginPath(); ctx.arc(sx, sy, 150, 0, TAU); ctx.fill();
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+/* ═══════════════ 13. 车 ═══════════════ */
+function drawCarBody() {
+  const sx = car.x - cam.x, sy = car.y - cam.y;
+  ctx.save();
+  ctx.translate(sx, sy);
+  ctx.rotate(car.a);
+  if (car.jolt > 0) {
+    const j = car.jolt / 0.30;
+    ctx.translate(0, j * 2.5);
+    ctx.scale(1, 1 - j * 0.09);
+  }
+
+  const braking = car.heat > 0.02 || car.brakeFail > 0 || car.cutT > 0;
+
+  /* 尾灯拖影 */
+  if (car.spd > 40) {
+    ctx.fillStyle = 'rgba(255,60,60,' + clamp(car.spd / 400, 0.1, 0.35) + ')';
+    ctx.beginPath(); ctx.ellipse(0, 26, 9, 6, 0, 0, TAU); ctx.fill();
+  }
+
+  /* 尾灯在湿柏油上的倒影 */
+  ctx.fillStyle = braking ? 'rgba(255,60,60,.16)' : 'rgba(160,40,40,.10)';
+  ctx.beginPath(); ctx.ellipse(0, 36, 7, 18, 0, 0, TAU); ctx.fill();
+
+  /* 影子 */
+  ctx.fillStyle = 'rgba(0,0,0,.55)';
+  roundRect(ctx, -CFG.car.wid / 2 + 3, -CFG.car.len / 2 + 5, CFG.car.wid, CFG.car.len, 8); ctx.fill();
+
+  /* 轮子 */
+  ctx.fillStyle = '#0e1116';
+  const wl = 3.4, ww = 9;
+  for (const p of [[-13, -15], [13, -15], [-13, 15], [13, 15]]) {
+    ctx.save();
+    ctx.translate(p[0], p[1]);
+    if (p[1] < 0) ctx.rotate(car.steer * 0.42);
+    roundRect(ctx, -wl, -ww / 2, wl * 2, ww, 2); ctx.fill();
+    ctx.restore();
+  }
+
+  /* 车身 */
+  const grad = ctx.createLinearGradient(-14, 0, 14, 0);
+  grad.addColorStop(0, '#e39a2f');
+  grad.addColorStop(0.5, '#ffc163');
+  grad.addColorStop(1, '#c98424');
+  ctx.fillStyle = grad;
+  roundRect(ctx, -CFG.car.wid / 2, -CFG.car.len / 2, CFG.car.wid, CFG.car.len, 8); ctx.fill();
+
+  /* 高光：一道斜向的白色渐变，塑料感立刻变成车漆 */
+  const hg = ctx.createLinearGradient(-14, -27, 12, 27);
+  hg.addColorStop(0, 'rgba(255,255,255,.34)');
+  hg.addColorStop(0.32, 'rgba(255,255,255,.06)');
+  hg.addColorStop(1, 'rgba(255,255,255,0)');
+  ctx.fillStyle = hg;
+  roundRect(ctx, -CFG.car.wid / 2, -CFG.car.len / 2, CFG.car.wid, CFG.car.len, 8); ctx.fill();
+
+  /* 车顶/座舱 */
+  ctx.fillStyle = '#1a1f28';
+  roundRect(ctx, -9, -12, 18, 22, 5); ctx.fill();
+  ctx.fillStyle = 'rgba(140,190,230,.35)';
+  roundRect(ctx, -7, -10, 14, 8, 3); ctx.fill();
+
+  /* 前灯 + 刹车灯 */
+  ctx.fillStyle = '#fff6d8';
+  ctx.fillRect(-10, -CFG.car.len / 2 + 1, 6, 4);
+  ctx.fillRect(4, -CFG.car.len / 2 + 1, 6, 4);
+  ctx.fillStyle = braking ? '#ff3b3b' : '#8c1f1f';
+  ctx.fillRect(-10, CFG.car.len / 2 - 5, 6, 4);
+  ctx.fillRect(4, CFG.car.len / 2 - 5, 6, 4);
+
+  ctx.restore();
+}
+
+/* ═══════════════ 14. HUD ═══════════════ */
+const PANEL = { x: 672, y: 56, w: 272, h: 520 };
+
+function drawProgress() {
+  const x = 26, y = 38, w = 620, h = 5;
+  ctx.fillStyle = 'rgba(255,255,255,.10)';
+  roundRect(ctx, x, y, w, h, 3); ctx.fill();
+  const pr = clamp(car.s / track.total, 0, 1);
+  ctx.fillStyle = PAL.amber;
+  roundRect(ctx, x, y, Math.max(2, w * pr), h, 3); ctx.fill();
+  /* 终点旗 */
+  ctx.fillStyle = 'rgba(232,238,248,.55)';
+  ctx.fillRect(x + w - 2, y - 5, 2, 15);
+  /* 车标 */
+  ctx.fillStyle = '#fff';
+  ctx.beginPath();
+  const mx = x + w * pr;
+  ctx.moveTo(mx, y - 5); ctx.lineTo(mx + 5, y - 12); ctx.lineTo(mx - 5, y - 12);
+  ctx.closePath(); ctx.fill();
+
+  const t = stats.time + stats.crashes * CFG.crash.penalty;
+  txt(fmtTime(t), x, 26, 21, PAL.text, 'left', 700);
+  if (runMode === 'rally') {
+    txt('赛段 ' + (stageIdx + 1) + '/' + STAGE_COUNT + ' · ' + STAGE_NAMES[stageIdx], 128, 25, 11,
+      'rgba(79,224,208,.72)', 'left', 600);
+  }
+  txt('剩 ' + Math.round(meters(Math.max(0, track.total - car.s))) + ' 米', x + w, 25, 11,
+    'rgba(232,238,248,.45)', 'right', 600);
+  if (stats.crashes > 0) {
+    txt('+' + (stats.crashes * CFG.crash.penalty).toFixed(1) + 's 罚时', x + w - 78, 25, 10.5,
+      'rgba(255,90,90,.78)', 'right', 600);
+  }
+}
+
+function drawPanel() {
+  const P = PANEL;
+  roundRect(ctx, P.x, P.y, P.w, P.h, 18);
+  ctx.fillStyle = 'rgba(8,13,19,.80)'; ctx.fill();
+  ctx.strokeStyle = 'rgba(79,224,208,.22)'; ctx.lineWidth = 1; ctx.stroke();
+
+  /* 头部 */
+  txt('领航', P.x + 18, P.y + 28, 13, PAL.cyan, 'left', 800);
+  txt('P2', P.x + 56, P.y + 28, 10, 'rgba(79,224,208,.5)', 'left', 700);
+  txt('前方 ' + Math.round(meters(1700)) + ' 米', P.x + P.w - 16, P.y + 28, 11.5, 'rgba(232,238,248,.55)', 'right', 600);
+
+  /* ── 地图 ── */
+  const mx = P.x + 14, my = P.y + 42, mw = P.w - 28, mh = 302;
+  roundRect(ctx, mx, my, mw, mh, 12);
+  ctx.fillStyle = 'rgba(3,6,10,.72)'; ctx.fill();
+  ctx.save();
+  roundRect(ctx, mx, my, mw, mh, 12); ctx.clip();
+
+  const span = 1700;                    // 面板里显示前方 1700px ≈ 141m
+  const sy = mh / span;
+  const cx = mx + mw / 2;
+  const baseY = my + mh - 26;
+
+  // 先量一下这段路横向摆多远，再决定缩放，保证不画出面板
+  let maxOff = 120;
+  for (let s = car.s; s <= car.s + span; s += 40) {
+    maxOff = Math.max(maxOff, Math.abs(sampleAt(track, s).x - car.x));
+  }
+  const kx = Math.min(0.135, (mw * 0.40) / maxOff);
+
+  const mapPt = (s) => {
+    const p = sampleAt(track, s);
+    return { x: cx + (p.x - car.x) * kx, y: baseY - (s - car.s) * sy, half: p.half * kx };
+  };
+  /* 路面 */
+  ctx.beginPath();
+  for (let s = car.s; s <= car.s + span; s += 26) {
+    const q = mapPt(s);
+    if (s === car.s) ctx.moveTo(q.x + q.half, q.y); else ctx.lineTo(q.x + q.half, q.y);
+  }
+  for (let s = car.s + span; s >= car.s; s -= 26) {
+    const q = mapPt(s);
+    ctx.lineTo(q.x - q.half, q.y);
+  }
+  ctx.closePath();
+  ctx.fillStyle = 'rgba(90,110,135,.40)'; ctx.fill();
+  ctx.strokeStyle = 'rgba(120,150,180,.35)'; ctx.lineWidth = 1; ctx.stroke();
+
+  /* 危险/道具标记 */
+  for (let k = 0; k < track.haz.length; k++) {
+    const h = track.haz[k];
+    if (h[0] < car.s - 30 || h[0] > car.s + span) continue;
+    const q = mapPt(h[0]);
+    if (h[1] === 0) { ctx.fillStyle = '#e8d8b0'; ctx.beginPath(); ctx.arc(q.x, q.y, 3, 0, TAU); ctx.fill(); }
+    else if (h[1] === 1) { ctx.fillStyle = 'rgba(255,90,90,.9)'; ctx.fillRect(q.x - 4, q.y - 3, 8, 6); }
+    else if (h[1] === 2) { ctx.fillStyle = PAL.amber; ctx.fillRect(q.x - 2.5, q.y - 4, 5, 8); }
+    else if (h[1] === 3) { ctx.strokeStyle = 'rgba(255,179,71,.8)'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(q.x, q.y, 5, 0, TAU); ctx.stroke(); }
+    else if (h[1] === 4) {
+      ctx.fillStyle = '#fff';
+      ctx.fillRect(q.x - 5, q.y - 5, 10, 10);
+      ctx.fillStyle = '#111';
+      ctx.fillRect(q.x - 5, q.y - 5, 5, 5); ctx.fillRect(q.x, q.y, 5, 5);
+    }
+  }
+
+  /* 领航的标记 */
+  for (let k = 0; k < marks.length; k++) {
+    if (marks[k].s < car.s - 30 || marks[k].s > car.s + span) continue;
+    const q = mapPt(marks[k].s);
+    ctx.fillStyle = 'rgba(79,224,208,.95)';
+    ctx.beginPath(); ctx.arc(q.x, q.y, 3.2, 0, TAU); ctx.fill();
+    ctx.strokeStyle = 'rgba(79,224,208,.6)'; ctx.lineWidth = 1.2;
+    ctx.beginPath(); ctx.arc(q.x, q.y, 7, 0, TAU); ctx.stroke();
+  }
+
+  /* 车 */
+  ctx.fillStyle = PAL.amber;
+  ctx.beginPath();
+  ctx.moveTo(cx, baseY - 7); ctx.lineTo(cx + 5.5, baseY + 5); ctx.lineTo(cx - 5.5, baseY + 5);
+  ctx.closePath(); ctx.fill();
+  ctx.restore();
+
+  /* 下一个弯的播报——副驾最需要的一句话 */
+  let turnKind = '', turnD = 0;
+  for (let d = 110; d < 780; d += 24) {
+    const k = curvatureAt(track, car.s + d, 130);
+    if (k > 0.0038) { turnKind = '发夹弯'; turnD = d; break; }
+    if (k > 0.0023) { turnKind = '急弯'; turnD = d; break; }
+  }
+  if (turnKind) {
+    const near30 = turnD < 260;
+    const blink = near30 ? (0.55 + 0.45 * Math.sin(gameTime * 9)) : 0.9;
+    ctx.globalAlpha = blink;
+    txt(turnKind + '  ' + Math.round(meters(turnD)) + 'm', mx + 10, my + mh - 8, 12,
+      near30 ? PAL.amber : 'rgba(79,224,208,.9)', 'left', 800);
+    ctx.globalAlpha = 1;
+  }
+
+  /* ── 仪表 ── */
+  const gy = my + mh + 16;
+  const barW = mw - 74;
+
+  const heat = car.heat;
+  txt('刹车', mx, gy + 9, 11, 'rgba(232,238,248,.5)', 'left', 600);
+  ctx.fillStyle = 'rgba(255,255,255,.15)';
+  roundRect(ctx, mx + 42, gy, barW, 9, 4); ctx.fill();
+  ctx.fillStyle = car.brakeFail > 0 ? PAL.red : (heat > 0.72 ? '#ff8347' : PAL.cyan);
+  roundRect(ctx, mx + 42, gy, Math.max(2, barW * clamp(heat, 0, 1)), 9, 4); ctx.fill();
+  if (car.brakeFail > 0) txt('过热失灵', P.x + P.w - 16, gy + 9, 10.5, PAL.red, 'right', 800);
+
+  const fuelRow = gy + 24;
+  txt('油量', mx, fuelRow + 9, 11, 'rgba(232,238,248,.5)', 'left', 600);
+  ctx.fillStyle = 'rgba(255,255,255,.15)';
+  roundRect(ctx, mx + 42, fuelRow, barW, 9, 4); ctx.fill();
+  ctx.fillStyle = car.fuel < 20 ? PAL.red : PAL.amber;
+  roundRect(ctx, mx + 42, fuelRow, Math.max(2, barW * (car.fuel / CFG.fuel.max)), 9, 4); ctx.fill();
+
+  const row3 = fuelRow + 30;
+  txt('撞车 ' + stats.crashes, mx, row3, 11, 'rgba(232,238,248,.5)', 'left', 600);
+  txt('鸣笛 ' + stats.honks, mx + 92, row3, 11, 'rgba(232,238,248,.5)', 'left', 600);
+}
+
+function drawSpeed() {
+  const v = kmh(Math.abs(car.vf));
+  txt(Math.round(v), 148, 552, 56, PAL.text, 'right', 800, 'alphabetic');
+  txt('km/h', 148, 570, 12, 'rgba(232,238,248,.4)', 'right', 600);
+  /* 油门条 */
+  const bw = 6, bh = 78, bx = 160, by = 474;
+  ctx.fillStyle = 'rgba(255,255,255,.15)';
+  roundRect(ctx, bx, by, bw, bh, 3); ctx.fill();
+  const gasLevel = readInput().gas ? 1 : clamp(car.vf / CFG.speed.max, 0, 1);
+  const hgt = bh * gasLevel;
+  ctx.fillStyle = PAL.amber;
+  roundRect(ctx, bx, by + bh - hgt, bw, hgt, 3); ctx.fill();
+  txt('油门', bx + 11, by + bh, 10, 'rgba(232,238,248,.35)', 'left', 600);
+}
+
+function drawTach() {
+  const x = 268, y = 506, w = 330, h = 16;
+  const rpm = car.rpm || CFG.rpm.idle;
+  const r = clamp(rpm / CFG.rpm.max, 0, 1);
+  const redAt = CFG.rpm.red / CFG.rpm.max;
+  const cutAt = CFG.rpm.cut / CFG.rpm.max;
+
+  ctx.fillStyle = 'rgba(255,255,255,.10)';
+  roundRect(ctx, x, y, w, h, 8); ctx.fill();
+  ctx.fillStyle = 'rgba(255,90,90,.18)';
+  roundRect(ctx, x + w * redAt, y, w * (1 - redAt), h, 8); ctx.fill();
+
+  const g = ctx.createLinearGradient(x, 0, x + w, 0);
+  g.addColorStop(0, '#3ec9bb');
+  g.addColorStop(0.68, '#ffb347');
+  g.addColorStop(0.86, '#ff7a45');
+  g.addColorStop(1, '#ff3b3b');
+  ctx.fillStyle = g;
+  roundRect(ctx, x, y, Math.max(4, w * r), h, 8); ctx.fill();
+
+  ctx.fillStyle = 'rgba(255,255,255,.55)';
+  ctx.fillRect(x + w * cutAt, y - 4, 2, h + 8);
+
+  /* 挡位（换挡瞬间闪一下 + 弹一下） */
+  const fl = car.shiftFlash > 0 ? car.shiftFlash / 0.45 : 0;
+  const gearTxt = car.gear === 0 ? 'R' : String(car.gear);
+  if (fl > 0) {
+    ctx.globalAlpha = fl * 0.55;
+    ctx.fillStyle = car.gear === 0 ? PAL.red : PAL.cyan;
+    roundRect(ctx, 172, y - 21, 88, h + 42, 15);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+  roundRect(ctx, 180, y - 14, 72, h + 28, 12);
+  ctx.fillStyle = car.gear === 0 ? 'rgba(255,90,90,.18)' : 'rgba(255,179,71,.14)';
+  ctx.fill();
+  ctx.strokeStyle = car.gear === 0 ? 'rgba(255,90,90,.5)' : 'rgba(255,179,71,.35)';
+  ctx.lineWidth = 1.2; ctx.stroke();
+  ctx.save();
+  ctx.translate(216, y + 15);
+  const gs = 1 + fl * 0.22;
+  ctx.scale(gs, gs);
+  txt(gearTxt, 0, 0, 28, car.gear === 0 ? PAL.red : PAL.amber, 'center', 800);
+  ctx.restore();
+
+  /* 状态提示（只显示一条最要紧的） */
+  let tip = '', col = PAL.text;
+  if (car.gear === 0) { tip = '倒挡 · 按 ↑ 回一挡'; col = PAL.red; }
+  else if (car.gear < 4 && rpm >= CFG.rpm.red - 120) {
+    tip = stats.shifts === 0 ? '让副驾按 ↑ 升档' : '升档 ▲';
+    col = PAL.red;
+  }
+  else if (car.limiterT > 2.2) { tip = '引擎过热'; col = PAL.red; }
+  else if (car.boostT > 0) { tip = '完美换挡'; col = PAL.cyan; }
+  else if (rpm < 1600 && car.gear > 1) { tip = '拖挡 · 降一挡'; col = 'rgba(232,238,248,.45)'; }
+  if (tip) {
+    const blink = (col === PAL.red) ? (0.66 + 0.34 * Math.sin(gameTime * 12)) : 1;
+    ctx.globalAlpha = blink;
+    txt(tip, x + w, y - 10, 12, col, 'right', 800);
+    ctx.globalAlpha = 1;
+  }
+
+  /* 和幽灵的差距 */
+  if (ghost && ghost.visible) {
+    const d = ghostDelta;
+    txt((d >= 0 ? '幽灵 +' : '幽灵 −') + Math.abs(d).toFixed(0) + 'm', x + w, y + 36, 11,
+      d >= 0 ? 'rgba(79,224,208,.85)' : 'rgba(255,90,90,.85)', 'right', 700);
+  }
+}
+
+function drawToast() {
+  if (toastT <= 0) return;
+  const a = clamp(toastT / 0.5, 0, 1);
+  ctx.globalAlpha = a;
+  txt(toastMsg, W / 2 - 108, 120, 16, toastColor, 'center', 800);
+  ctx.globalAlpha = 1;
+}
+
+function drawFlash() {
+  if (cam.shake <= 0.02) return;
+  const a = cam.shake * 0.30;
+  const g = ctx.createRadialGradient(W / 2, H / 2, H * 0.25, W / 2, H / 2, H * 0.8);
+  g.addColorStop(0, 'rgba(255,60,60,0)');
+  g.addColorStop(1, 'rgba(255,40,40,' + a + ')');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+}
+
+function drawWorld() {
+  const sh = (cam.shake || 0) * 6 + (cam.kick || 0) * 3.2;
+  const ox = (hash2(Math.floor(gameTime * 120), 5) - 0.5) * sh;
+  const oy = (hash2(Math.floor(gameTime * 120), 9) - 0.5) * sh;
+  ctx.save();
+  ctx.translate(-cam.x + ox, -cam.y + oy);
+  drawGrass();
+  drawPuddles();
+  drawRoad();
+  drawSkids();
+  drawGhostCar();
+  drawDecor();
+  drawCans();
+  drawCows();
+  drawRocks();
+  drawParts();
+  ctx.restore();
+}
+
+/* ═══════════════ 14.6 二维码（从坦克对决复用，已验证解码） ═══════════════ */
+const QR = (function () {
+  const SPEC = {
+    1:  { ec: 10, blocks: [[1, 16]] },
+    2:  { ec: 16, blocks: [[1, 28]] },
+    3:  { ec: 26, blocks: [[1, 44]] },
+    4:  { ec: 18, blocks: [[2, 32]] },
+    5:  { ec: 24, blocks: [[2, 43]] },
+    6:  { ec: 16, blocks: [[4, 27]] },
+    7:  { ec: 18, blocks: [[4, 31]] },
+    8:  { ec: 22, blocks: [[2, 38], [2, 39]] },
+    9:  { ec: 22, blocks: [[3, 36], [2, 37]] },
+    10: { ec: 26, blocks: [[4, 43], [1, 44]] }
+  };
+  const ALIGN = {
+    1: [], 2: [6, 18], 3: [6, 22], 4: [6, 26], 5: [6, 30],
+    6: [6, 34], 7: [6, 22, 38], 8: [6, 24, 42], 9: [6, 26, 46], 10: [6, 28, 50]
+  };
+
+  const EXP = new Uint8Array(512), LOG = new Uint8Array(256);
+  (function () {
+    let x = 1;
+    for (let i = 0; i < 255; i++) { EXP[i] = x; LOG[x] = i; x <<= 1; if (x & 0x100) x ^= 0x11d; }
+    for (let i = 255; i < 512; i++) EXP[i] = EXP[i - 255];
+  })();
+  const gmul = (a, b) => (a === 0 || b === 0 ? 0 : EXP[LOG[a] + LOG[b]]);
+
+  function rsGenPoly(deg) {
+    let poly = [1];
+    for (let i = 0; i < deg; i++) {
+      const next = new Array(poly.length + 1).fill(0);
+      for (let j = 0; j < poly.length; j++) {
+        next[j] ^= poly[j];
+        next[j + 1] ^= gmul(poly[j], EXP[i]);
+      }
+      poly = next;
+    }
+    return poly;
+  }
+  function rsEncode(data, ecLen) {
+    const gen = rsGenPoly(ecLen);
+    const res = new Array(data.length + ecLen).fill(0);
+    for (let i = 0; i < data.length; i++) res[i] = data[i];
+    for (let i = 0; i < data.length; i++) {
+      const f = res[i];
+      if (!f) continue;
+      for (let j = 0; j < gen.length; j++) res[i + j] ^= gmul(gen[j], f);
+    }
+    return res.slice(data.length);
+  }
+  function dataCodewords(v) {
+    let n = 0;
+    for (const [c, d] of SPEC[v].blocks) n += c * d;
+    return n;
+  }
+  function formatBits(d) {
+    let v = d << 10;
+    for (let i = 14; i >= 10; i--) if ((v >>> i) & 1) v ^= 0x537 << (i - 10);
+    return ((d << 10) | v) ^ 0x5412;
+  }
+  function versionBits(v) {
+    let x = v << 12;
+    for (let i = 17; i >= 12; i--) if ((x >>> i) & 1) x ^= 0x1f25 << (i - 12);
+    return (v << 12) | x;
+  }
+
+  function build(version, bytes) {
+    const size = version * 4 + 17, spec = SPEC[version];
+    const capBits = dataCodewords(version) * 8;
+    const bits = [];
+    const push = (val, len) => { for (let i = len - 1; i >= 0; i--) bits.push((val >>> i) & 1); };
+    push(4, 4);
+    push(bytes.length, version < 10 ? 8 : 16);
+    for (const b of bytes) push(b, 8);
+    for (let i = 0; i < 4 && bits.length < capBits; i++) bits.push(0);
+    while (bits.length % 8) bits.push(0);
+    const dataCw = [];
+    for (let i = 0; i < bits.length; i += 8) {
+      let v = 0;
+      for (let j = 0; j < 8; j++) v = (v << 1) | bits[i + j];
+      dataCw.push(v);
+    }
+    const pad = [0xec, 0x11];
+    for (let i = 0; dataCw.length < capBits / 8; i++) dataCw.push(pad[i % 2]);
+
+    const blocks = [];
+    let off = 0;
+    for (const [count, dcw] of spec.blocks) {
+      for (let b = 0; b < count; b++) {
+        const data = dataCw.slice(off, off + dcw);
+        off += dcw;
+        blocks.push({ data, ec: rsEncode(data, spec.ec) });
+      }
+    }
+    const out = [];
+    const maxData = Math.max.apply(null, blocks.map((b) => b.data.length));
+    for (let i = 0; i < maxData; i++) for (const b of blocks) if (i < b.data.length) out.push(b.data[i]);
+    for (let i = 0; i < spec.ec; i++) for (const b of blocks) out.push(b.ec[i]);
+
+    const modules = new Uint8Array(size * size);
+    const fn = new Uint8Array(size * size);
+    const set = (x, y, dark) => {
+      if (x < 0 || y < 0 || x >= size || y >= size) return;
+      const p = y * size + x;
+      modules[p] = dark ? 1 : 0; fn[p] = 1;
+    };
+    const finder = (cx, cy) => {
+      for (let dy = -4; dy <= 4; dy++) for (let dx = -4; dx <= 4; dx++) {
+        const d = Math.max(Math.abs(dx), Math.abs(dy));
+        set(cx + dx, cy + dy, d !== 2 && d !== 4);
+      }
+    };
+    // 先画 timing，再画 finder（finder 会覆盖 timing 在角落的部分，顺序不能反）
+    for (let i = 0; i < size; i++) { set(6, i, i % 2 === 0); set(i, 6, i % 2 === 0); }
+    finder(3, 3); finder(size - 4, 3); finder(3, size - 4);
+    const al = ALIGN[version] || [];
+    for (let i = 0; i < al.length; i++) for (let j = 0; j < al.length; j++) {
+      if ((i === 0 && j === 0) || (i === 0 && j === al.length - 1) || (i === al.length - 1 && j === 0)) continue;
+      for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) {
+        set(al[i] + dx, al[j] + dy, Math.max(Math.abs(dx), Math.abs(dy)) !== 1);
+      }
+    }
+    set(8, size - 8, true);
+    for (let i = 0; i <= 5; i++) set(8, i, false);
+    set(8, 7, false); set(8, 8, false); set(7, 8, false);
+    for (let i = 9; i < 15; i++) set(14 - i, 8, false);
+    for (let i = 0; i < 8; i++) set(size - 1 - i, 8, false);
+    for (let i = 8; i < 15; i++) set(8, size - 15 + i, false);
+    if (version >= 7) {
+      const vb = versionBits(version);
+      for (let i = 0; i < 18; i++) {
+        const bit = (vb >>> i) & 1;
+        const a = size - 11 + (i % 3), b = Math.floor(i / 3);
+        set(a, b, !!bit); set(b, a, !!bit);
+      }
+    }
+    let idx = 0;
+    for (let right = size - 1; right >= 1; right -= 2) {
+      if (right === 6) right = 5;
+      for (let vert = 0; vert < size; vert++) {
+        for (let j = 0; j < 2; j++) {
+          const x = right - j;
+          const upward = ((right + 1) & 2) === 0;
+          const y = upward ? size - 1 - vert : vert;
+          const p = y * size + x;
+          if (!fn[p] && idx < out.length * 8) {
+            modules[p] = (out[idx >> 3] >>> (7 - (idx & 7))) & 1;
+            idx++;
+          }
+        }
+      }
+    }
+    const maskBit = (mask, x, y) => {
+      switch (mask) {
+        case 0: return (x + y) % 2 === 0;
+        case 1: return y % 2 === 0;
+        case 2: return x % 3 === 0;
+        case 3: return (x + y) % 3 === 0;
+        case 4: return (Math.floor(x / 3) + Math.floor(y / 2)) % 2 === 0;
+        case 5: return (x * y) % 2 + (x * y) % 3 === 0;
+        case 6: return ((x * y) % 2 + (x * y) % 3) % 2 === 0;
+        default: return ((x + y) % 2 + (x * y) % 3) % 2 === 0;
+      }
+    };
+    const drawFormat = (m, mask) => {
+      const bits2 = formatBits((0 << 3) | mask);   // ECC 级别 M = 00
+      const put = (x, y, bit) => { m[y * size + x] = bit ? 1 : 0; };
+      for (let i = 0; i <= 5; i++) put(8, i, (bits2 >>> i) & 1);
+      put(8, 7, (bits2 >>> 6) & 1);
+      put(8, 8, (bits2 >>> 7) & 1);
+      put(7, 8, (bits2 >>> 8) & 1);
+      for (let i = 9; i < 15; i++) put(14 - i, 8, (bits2 >>> i) & 1);
+      for (let i = 0; i < 8; i++) put(size - 1 - i, 8, (bits2 >>> i) & 1);
+      for (let i = 8; i < 15; i++) put(8, size - 15 + i, (bits2 >>> i) & 1);
+      put(8, size - 8, 1);
+    };
+    const penalty = (m) => {
+      let score = 0;
+      for (let y = 0; y < size; y++) {
+        let run = 1;
+        for (let x = 1; x < size; x++) {
+          if (m[y * size + x] === m[y * size + x - 1]) { run++; }
+          else { if (run >= 5) score += run - 2; run = 1; }
+        }
+        if (run >= 5) score += run - 2;
+      }
+      for (let x = 0; x < size; x++) {
+        let run = 1;
+        for (let y = 1; y < size; y++) {
+          if (m[y * size + x] === m[(y - 1) * size + x]) { run++; }
+          else { if (run >= 5) score += run - 2; run = 1; }
+        }
+        if (run >= 5) score += run - 2;
+      }
+      for (let y = 0; y < size - 1; y++) for (let x = 0; x < size - 1; x++) {
+        const p = y * size + x;
+        const c = m[p];
+        if (c === m[p + 1] && c === m[p + size] && c === m[p + size + 1]) score += 3;
+      }
+      let dark = 0;
+      for (let i = 0; i < m.length; i++) dark += m[i];
+      const ratio = Math.abs((dark * 100) / (size * size) - 50);
+      score += Math.floor(ratio / 5) * 10;
+      return score;
+    };
+    let best = null, bestScore = Infinity;
+    for (let mask = 0; mask < 8; mask++) {
+      const m = modules.slice();
+      for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) {
+        const p = y * size + x;
+        if (!fn[p] && maskBit(mask, x, y)) m[p] ^= 1;
+      }
+      drawFormat(m, mask);
+      const sc = penalty(m);
+      if (sc < bestScore) { bestScore = sc; best = m; }
+    }
+    return { size, modules: best, version };
+  }
+
+  function make(text) {
+    const bytes = Array.from(new TextEncoder().encode(String(text)));
+    for (let v = 1; v <= 10; v++) {
+      const cc = v < 10 ? 8 : 16;
+      if (4 + cc + bytes.length * 8 <= dataCodewords(v) * 8) return build(v, bytes);
+    }
+    throw new Error('QR: 内容过长（>213 字节）');
+  }
+  return { make };
+})();
+
+const qrCache = new Map();
+function qrFor(text) {
+  if (!qrCache.has(text)) {
+    try { qrCache.set(text, QR.make(text)); } catch (e) { qrCache.set(text, null); }
+  }
+  return qrCache.get(text);
+}
+function drawQR(qr, x, y, box) {
+  if (!qr) return;
+  const cell = Math.max(3, Math.floor(box / (qr.size + 6)));
+  const pad = cell * 3;
+  const w = qr.size * cell + pad * 2;
+  ctx.fillStyle = '#ffffff';
+  roundRect(ctx, x, y, w, w, 10); ctx.fill();
+  ctx.fillStyle = '#0a0f19';
+  for (let my = 0; my < qr.size; my++) {
+    const rowBase = my * qr.size;
+    for (let mx = 0; mx < qr.size; mx++) {
+      if (qr.modules[rowBase + mx]) {
+        ctx.fillRect(x + pad + mx * cell, y + pad + my * cell, cell + 0.5, cell + 0.5);
+      }
+    }
+  }
+  return w;
+}
+
+/* ═══════════════ 15. 输入 ═══════════════ */
+const keys = Object.create(null);
+const padIn = { steer: 0, gas: 0, brake: 0, up: 0, down: 0, horn: 0 };
+const SEARCH = (typeof location !== 'undefined' && location.search) || '';
+const LAN = /[?&]lan(=|&|$)/.test(SEARCH);
+const AUTO = /[?&]auto/.test(SEARCH);
+const AUTO_SEED = (function () {
+  const m = SEARCH.match(/[?&]seed=(\d+)/);
+  return m ? (Number(m[1]) | 0) : 20261029;
+})();
+const NAIVE = /[?&]naive/.test(typeof location !== 'undefined' ? location.search : '');
+let naiveMode = NAIVE;
+let soloMode = /[?&]solo/.test(typeof location !== 'undefined' ? location.search : '');
+const AUTO_DIFF = (function () {
+  const m = SEARCH.match(/[?&]diff=(\w+)/);
+  return m && DIFFS[m[1]] ? m[1] : 'normal';
+})();
+
+let qrOverlay = false;
+let demoTrack = null, demoCar = null, demoCam = { x: 0, y: 0, shake: 0, kick: 0 }, demoCamReady = false;
+/* 菜单背景用一档更亮、雨更小的画面，不然文字背后一片黑 */
+const DEMO_DIFF = Object.assign({}, DIFFS.normal, { dark: 0.70, rain: 0.35 });
+
+function pollPads() {
+  padIn.steer = 0; padIn.gas = 0; padIn.brake = 0; padIn.up = 0; padIn.down = 0; padIn.horn = 0;
+  if (!navigator || !navigator.getGamepads) return;
+  let list;
+  try { list = navigator.getGamepads(); } catch (e) { return; }
+  if (!list) return;
+  const live = [];
+  for (let i = 0; i < list.length; i++) if (list[i] && list[i].connected) live.push(list[i]);
+  if (!live.length) return;
+  const P1 = live[0], P2 = live[1] || null;
+  const dz = (v) => (Math.abs(v) < 0.18 ? 0 : v);
+  padIn.steer = clamp(dz(P1.axes && P1.axes[0] || 0), -1, 1);
+  const rt = P1.buttons && P1.buttons[7];
+  if (rt && (rt.value > 0.1 || rt.pressed)) padIn.gas = 1;
+  const readP2 = (pad) => {
+    const lt = pad.buttons && pad.buttons[6];
+    if (lt && (lt.value > 0.1 || lt.pressed)) padIn.brake = 1;
+    const lb = pad.buttons && pad.buttons[4], rb = pad.buttons && pad.buttons[5];
+    if (lb && lb.pressed) padIn.down = 1;
+    if (rb && rb.pressed) padIn.up = 1;
+    const b0 = pad.buttons && pad.buttons[0];
+    if (b0 && b0.pressed) padIn.horn = 1;
+  };
+  readP2(P2 || P1);
+}
+
+/**
+ * 合并键盘 / 手柄 / 手机，返回这一帧的操作。
+ * 座位分工：司机只有 A/D + W；副驾拿 ↑↓ 换挡、空格 刹车、L 鸣笛。
+ */
+function readInput() {
+  let steer = 0, gas = 0, brake = 0, up = 0, down = 0, horn = 0;
+  if (keys.KeyA) steer -= 1;
+  if (keys.KeyD) steer += 1;
+  if (keys.KeyW) gas = 1;
+  if (keys.Space || keys.KeyJ) brake = 1;
+  if (keys.ArrowUp || keys.KeyI) up = 1;
+  if (keys.ArrowDown || keys.KeyK) down = 1;
+  if (keys.KeyL || keys.Numpad0) horn = 1;
+
+  if (padIn.steer) steer = padIn.steer;
+  gas = gas || padIn.gas;
+  brake = brake || padIn.brake;
+  up = up || padIn.up;
+  down = down || padIn.down;
+  horn = horn || padIn.horn;
+
+  /* 手机当副驾/方向盘：手机会话优先 */
+  if (lan.pads[0] && !lan.stale[0] && lan.ctl[0]) {
+    steer = lan.ctl[0].steer;
+    gas = lan.ctl[0].gas;
+  }
+  if (lan.pads[1] && !lan.stale[1] && lan.ctl[1]) {
+    brake = lan.ctl[1].brake;
+    up = lan.ctl[1].up;
+    down = lan.ctl[1].down;
+    horn = lan.ctl[1].horn;
+  }
+  return {
+    steer: clamp(steer, -1, 1), gas: gas ? 1 : 0, brake: brake ? 1 : 0,
+    up: up ? 1 : 0, down: down ? 1 : 0, horn: horn ? 1 : 0
+  };
+}
+
+/* ═══════════════ 16. 手机联机（局域网） ═══════════════ */
+const lan = { ok: false, pads: [false, false], ctl: [null, null], at: [0, 0], stale: [false, false], url: '', ws: null, acc: 0, needTrack: false };
+
+function lanPadURL(p) {
+  let base = '';
+  if (typeof location !== 'undefined') {
+    const h = location.hostname;
+    const local = (h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '0.0.0.0');
+    if (!local) base = location.protocol + '//' + location.host;
+  }
+  if (!base) base = lan.url || (typeof location !== 'undefined' ? location.protocol + '//' + location.host : '');
+  return base + '/c?p=' + p;
+}
+
+function lanInit() {
+  if (!LAN || typeof WebSocket === 'undefined') return;
+  const base = ((typeof location !== 'undefined' && location.protocol === 'https:') ? 'wss://' : 'ws://') +
+    ((typeof location !== 'undefined') ? location.host : '');
+  const connect = () => {
+    let ws;
+    try { ws = new WebSocket(base + '/ws?role=host'); } catch (e) { setTimeout(connect, 1500); return; }
+    lan.ws = ws;
+    ws.onopen = () => { lan.ok = true; lan.needTrack = true; };
+    ws.onmessage = (ev) => {
+      let m;
+      try { m = JSON.parse(ev.data); } catch (e) { return; }
+      if (m.t === 'status') {
+        lan.pads = [!!(m.pads && m.pads[0]), !!(m.pads && m.pads[1])];
+        if (m.url) lan.url = m.url;
+        lan.needTrack = true;
+      } else if (m.t === 'mark') {
+        addMark(Number(m.m) || 0);
+      } else if (m.t === 'in' && m.p) {
+        const k = m.p - 1;
+        lan.ctl[k] = {
+          steer: clamp(Number(m.steer) || 0, -1, 1),
+          gas: m.gas ? 1 : 0, brake: m.brake ? 1 : 0,
+          up: m.up ? 1 : 0, down: (m.dn || m.rev) ? 1 : 0, horn: m.horn ? 1 : 0
+        };
+        lan.pads[k] = true;
+        lan.at[k] = gameTime;
+        lan.stale[k] = false;
+      }
+    };
+    ws.onclose = () => { lan.ok = false; lan.pads = [false, false]; setTimeout(connect, 1500); };
+    ws.onerror = () => {};
+  };
+  connect();
+}
+
+function lanSend(obj) {
+  if (!lan.ok || !lan.ws || lan.ws.readyState !== 1) return false;
+  try { lan.ws.send(JSON.stringify(obj)); return true; } catch (e) { return false; }
+}
+
+/** 开跑时把赛道推给副驾手机（降采样到 32px 一点，够画雷达图） */
+function lanSendTrack() {
+  lan.needTrack = true;
+  if (!track) return;
+  /* 手机端全部按「米」画（12px = 1m），这里统一换算 */
+  const PPM = 12;
+  const step = 4, pts = [], half = [];
+  for (let i = 0; i < track.pts.length; i += step) {
+    pts.push([+(track.pts[i].x / PPM).toFixed(2), +(track.pts[i].y / PPM).toFixed(2)]);
+    half.push(+(track.half[i] / PPM).toFixed(1));
+  }
+  const d = {
+    k: 'track', pts, half,
+    len: Math.round(track.total / PPM),
+    haz: track.haz.map((h) => [Math.round(h[0] / PPM), h[1]])
+  };
+  if (lanSend({ t: 'h2p', p: 2, d })) lan.needTrack = false;
+}
+
+function lanTick(dt) {
+  if (!LAN) return;
+  if (lan.needTrack) lanSendTrack();
+  /* 掉线保护：0.6s 没收到就归零，避免车自己往前冲 */
+  for (let i = 0; i < 2; i++) {
+    if (lan.pads[i] && !lan.stale[i] && gameTime - lan.at[i] > 0.6) {
+      lan.stale[i] = true;
+      if (lan.ctl[i]) lan.ctl[i] = { steer: 0, gas: 0, brake: 0, up: 0, down: 0, horn: 0 };
+    }
+  }
+  lan.acc += dt;
+  if (lan.acc < 0.1) return;
+  lan.acc = 0;
+  const PPM = 12;
+  const d = {
+    k: 'tick', s: Math.round(car.s / PPM), x: +(car.x / PPM).toFixed(2), y: +(car.y / PPM).toFixed(2),
+    a: car.a, spd: Math.round(kmh(Math.abs(car.vf))), heat: car.heat, fuel: car.fuel / CFG.fuel.max,
+    rpm: Math.round(car.rpm), rpmRed: CFG.rpm.red, rpmMax: CFG.rpm.max,
+    gear: car.gear, boost: car.boostT > 0 ? 1 : 0,
+    prog: clamp(car.s / track.total, 0, 1)
+  };
+  lanSend({ t: 'h2p', p: 2, d });
+  lanSend({ t: 'h2p', p: 1, d });
+}
+
+
+/* ═══════════════ 17. 自动驾驶（只给截图/测试用） ═══════════════ */
+const autoMem = { stuck: 0, rev: 0, lastS: 0, cool: 0 };
+function autopilot(tr, c) {
+  /* 卡住了就倒车脱困（真人也会这么干）；用"位移"判断，别用瞬时速度——速度在 0 附近抖会反复触发 */
+  autoMem.cool = Math.max(0, autoMem.cool - STEP);
+  if (Math.abs(c.s - autoMem.lastS) < 2.5) autoMem.stuck += STEP;
+  else { autoMem.stuck = 0; autoMem.lastS = c.s; }
+  if (autoMem.stuck > 1.0 && autoMem.cool <= 0) { autoMem.rev = 0.8; autoMem.stuck = 0; autoMem.cool = 2.2; }
+  if (autoMem.rev > 0) {
+    autoMem.rev -= STEP;
+    const p0 = sampleAt(tr, c.s + 60);
+    const want0 = Math.atan2(p0.x - c.x, -(p0.y - c.y));
+    return {
+      steer: clamp(-angDiff(c.a, want0) * 2.2, -1, 1),
+      gas: c.gear === 0 ? 1 : 0, brake: 0,
+      up: 0, down: c.gear === 0 ? 0 : 1, horn: 0
+    };
+  }
+  /* 提前看前方 5 段曲率，取最严的那个安全车速 */
+  let vLim = CFG.speed.max;
+  for (let d = 40; d <= 420; d += 95) {
+    vLim = Math.min(vLim, safeSpeed(curvatureAt(tr, c.s + d, 190)) * 1.06);
+  }
+  const v = Math.abs(c.vf);
+  const look = 110 + v * 0.30;
+  const p = sampleAt(tr, c.s + look);
+  const want = Math.atan2(p.x - c.x, -(p.y - c.y));
+  const err = angDiff(c.a, want);
+  const steer = clamp(err * 2.9, -1, 1);
+
+  /* 前方有牛就鸣笛 */
+  let horn = 0;
+  for (const w of cows) {
+    if (!w.alive || w.scared > 0) continue;
+    const ds = w.s - c.s;
+    if (ds > 30 && ds < 260 && dist2(w.x, w.y, c.x, c.y) < 300 * 300) { horn = 1; break; }
+  }
+  /* ?naive=1：模拟"一路踩死油门、只会打方向"的新手，用来验"这个弯到底抢不抢速度" */
+  /* 换挡：顶到红线就升，目标速度掉下来了就降（引擎制动） */
+  let up = 0, down = 0;
+  if (c.gear === 0) up = 1;
+  else {
+    if (c.rpm > 6000 && c.gear < 4) up = 1;
+    if (c.gear > 1 && c.rpm < 1900) down = 1;
+    else if (c.gear > 1 && vLim < gearMax(c.gear - 1) * 0.92 && v > vLim + 15) down = 1;
+  }
+  if (soloMode) { up = 0; down = 0; }      // 模拟"司机一个人玩"：够不到换挡键
+  const gas = naiveMode ? 1 : (v < vLim - 6 ? 1 : 0);
+  const brake = naiveMode
+    ? (Math.abs(err) > 0.75 || (v > 320 && Math.abs(err) > 0.42) ? 1 : 0)
+    : (v > vLim + 12 ? 1 : 0);
+  return { steer, gas, brake, up, down, horn };
+}
+
+/* ═══════════════ 18. 界面 ═══════════════ */
+function ensureDemo() {
+  if (demoTrack) return;
+  demoTrack = genTrack(20261029, 'normal');
+  demoCar = makeCar(demoTrack);
+  const p = sampleAt(demoTrack, 1150);
+  demoCar.x = p.x; demoCar.y = p.y; demoCar.a = p.angle + 0.35;
+  /* 把车摆到右下角，别被难度按钮压住 */
+  demoCam.x = demoCar.x - W * 0.74;
+  demoCam.y = demoCar.y - H * 0.74;
+}
+
+/** 菜单背景的"演示车"：沿赛道慢慢开，镜头跟着走 —— 静态背景变成活的 */
+function updateDemo() {
+  if (!demoTrack) return;
+  const span = Math.max(600, demoTrack.total - 2400);
+  const ds = 900 + (gameTime * 128) % span;
+  const p = sampleAt(demoTrack, ds);
+  demoCar.x = p.x; demoCar.y = p.y; demoCar.a = p.angle;
+  demoCar.vf = 128; demoCar.spd = 128; demoCar.gear = 3; demoCar.rpm = 4200;
+  const tx = demoCar.x - W * 0.5, ty = demoCar.y - H * 0.80;
+  if (!demoCamReady) { demoCam.x = tx; demoCam.y = ty; demoCamReady = true; }
+  else {
+    demoCam.x += (tx - demoCam.x) * 0.06;
+    demoCam.y += (ty - demoCam.y) * 0.06;
+  }
+}
+
+function drawMenuScene() {
+  ensureDemo();
+  const sT = track, sC = car, sCam = cam, sD = D;
+  track = demoTrack; car = demoCar; cam = demoCam; D = DEMO_DIFF;
+
+  /* 机位沿赛道缓缓前推：没有车，画面就是一条夜路 + 路灯 + 雨，不跟文字抢注意力 */
+  const span = Math.max(900, demoTrack.total - 1400);
+  const ds = 1100 + (gameTime * 66) % span;
+  const p = sampleAt(demoTrack, ds);
+  cam.x = p.x - W / 2;
+  cam.y = p.y - H * 0.60;
+
+  drawWorld();
+
+  const g = ctx.createRadialGradient(W / 2, H * 0.40, 70, W / 2, H * 0.40, 660);
+  g.addColorStop(0, 'rgba(255,255,255,1)');
+  g.addColorStop(0.5, 'rgba(236,240,247,1)');
+  g.addColorStop(0.8, 'rgba(150,160,176,1)');
+  g.addColorStop(1, 'rgba(62,70,84,1)');
+  ctx.globalCompositeOperation = 'multiply';
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+  ctx.globalCompositeOperation = 'source-over';
+
+  drawLamps();
+
+  track = sT; car = sC; cam = sCam; D = sD;
+
+  /* 压暗，保证文字可读（只压一点点，别把背景压死） */
+  ctx.fillStyle = 'rgba(4,6,11,.28)';
+  ctx.fillRect(0, 0, W, H);
+  const vg = ctx.createRadialGradient(W / 2, H * 0.42, 120, W / 2, H * 0.42, W * 0.8);
+  vg.addColorStop(0, 'rgba(0,0,0,0)');
+  vg.addColorStop(1, 'rgba(0,0,0,.55)');
+  ctx.fillStyle = vg;
+  ctx.fillRect(0, 0, W, H);
+
+  txt('双 人 一 车', W / 2, 132, 52, '#fff', 'center', 800);
+  txt('一 个 人 开 不 走 这 台 车', W / 2, 166, 14, 'rgba(255,179,71,.85)', 'center', 500);
+
+  /* 两张座位卡 */
+  const card = (x, seat, title, lines, color) => {
+    roundRect(ctx, x, 202, 330, 128, 16);
+    ctx.fillStyle = 'rgba(10,15,22,.78)'; ctx.fill();
+    ctx.strokeStyle = color === PAL.amber ? 'rgba(255,179,71,.34)' : 'rgba(79,224,208,.34)';
+    ctx.lineWidth = 1.4; ctx.stroke();
+    txt(title, x + 20, 232, 17, color, 'left', 800);
+    txt(seat, x + 84, 232, 11, 'rgba(232,238,248,.4)', 'left', 600);
+    for (let i = 0; i < lines.length; i++) {
+      txt(lines[i][0], x + 20, 262 + i * 26, 13, 'rgba(232,238,248,.86)', 'left', 600);
+      txt(lines[i][1], x + 310, 262 + i * 26, 11, 'rgba(232,238,248,.36)', 'right', 500);
+    }
+  };
+  card(118, 'P1 · 左', '司机', [['A / D', '转向'], ['W', '油门'], ['—', '够不到换挡']], PAL.amber);
+  card(512, 'P2 · 右', '领航', [['↑', '升档（盯转速）'], ['↓', '降档 / 挂 R'], ['空格', '刹车 · L 鸣笛']], PAL.cyan);
+
+  /* 难度 */
+  txt('难度', 360, 360, 12, 'rgba(232,238,248,.42)', 'right', 600);
+  for (let i = 0; i < 3; i++) {
+    const x = 380 + i * 98, y = 340, w = 88, h = 30;
+    const on = menuSel === i;
+    roundRect(ctx, x, y, w, h, 15);
+    ctx.fillStyle = on ? 'rgba(255,179,71,.18)' : 'rgba(255,255,255,.045)';
+    ctx.fill();
+    ctx.strokeStyle = on ? 'rgba(255,179,71,.8)' : 'rgba(255,255,255,.10)';
+    ctx.lineWidth = on ? 1.6 : 1; ctx.stroke();
+    txt(DIFFS[DIFF_KEYS[i]].name, x + w / 2, y + 20, 13, on ? PAL.amber : 'rgba(232,238,248,.55)', 'center', on ? 800 : 600);
+  }
+
+  /* 模式 */
+  txt('模式', 360, 404, 12, 'rgba(232,238,248,.42)', 'right', 600);
+  for (let i = 0; i < 2; i++) {
+    const x = 380 + i * 126, y = 384, w = 116, h = 30;
+    const on = menuMode === i;
+    roundRect(ctx, x, y, w, h, 15);
+    ctx.fillStyle = on ? 'rgba(79,224,208,.16)' : 'rgba(255,255,255,.045)';
+    ctx.fill();
+    ctx.strokeStyle = on ? 'rgba(79,224,208,.75)' : 'rgba(255,255,255,.10)';
+    ctx.lineWidth = on ? 1.6 : 1; ctx.stroke();
+    txt(i === 0 ? '单段' : '拉力三段', x + w / 2, y + 20, 13, on ? PAL.cyan : 'rgba(232,238,248,.55)', 'center', on ? 800 : 600);
+  }
+
+  /* 提示行 */
+  const blink = 0.6 + 0.4 * Math.sin(gameTime * 3.4);
+  ctx.globalAlpha = blink;
+  txt(menuMode === 1 ? '空格 / 回车  开跑（3 段）' : '空格 / 回车  发车', W / 2, 438, 16, '#fff', 'center', 700);
+  ctx.globalAlpha = 1;
+  txt('1 2 3 选难度 · S 切模式 · M 静音', W / 2, 464, 11.5, 'rgba(232,238,248,.34)', 'center', 500);
+
+  const best = menuMode === 1 ? (career.rally[DIFF_KEYS[menuSel]] || 0) : (career.best[DIFF_KEYS[menuSel]] || 0);
+  txt(best ? '最佳 ' + fmtTime(best) : '还没有跑过这条线', W / 2, 492, 12, 'rgba(232,238,248,.42)', 'center', 600);
+
+  if (LAN) {
+    const n = (lan.pads[0] ? 1 : 0) + (lan.pads[1] ? 1 : 0);
+    txt(lan.ok ? ('手机已连接 ' + n + '/2 · Q 显示二维码') : '手机服务未连接', W / 2, 518, 11.5,
+      lan.ok ? 'rgba(79,224,208,.75)' : 'rgba(255,90,90,.7)', 'center', 600);
+  }
+}
+
+function drawCountdown() {
+  const n = cdT > 1.5 ? '3' : cdT > 0.9 ? '2' : cdT > 0.3 ? '1' : '发车';
+  const frac = cdT > 1.5 ? (2.2 - cdT) / 0.7 : cdT > 0.9 ? (1.5 - cdT) / 0.6 : cdT > 0.3 ? (0.9 - cdT) / 0.6 : (0.3 - cdT) / 0.3;
+  const sc = 1 + (1 - clamp(frac, 0, 1)) * 0.35;
+  ctx.save();
+  ctx.translate(W / 2 - 108, H * 0.44);
+  ctx.scale(sc, sc);
+  txt(n, 0, 0, n === '发车' ? 62 : 96, n === '发车' ? PAL.amber : '#fff', 'center', 800, 'middle');
+  ctx.restore();
+  txt('A/D 转向 · W 油门  ‖  ↑↓ 换挡 · 空格 刹车', W / 2 - 108, H * 0.44 + 76, 12, 'rgba(232,238,248,.42)', 'center', 600);
+}
+
+function drawPause() {
+  ctx.fillStyle = 'rgba(3,5,9,.90)';
+  ctx.fillRect(0, 0, W, H);
+  txt('暂停', W / 2, 190, 40, '#fff', 'center', 800);
+  const rows = pauseRows();
+  for (let i = 0; i < rows.length; i++) {
+    const on = pauseSel === i;
+    const y = 250 + i * 46;
+    if (on) {
+      roundRect(ctx, W / 2 - 150, y - 24, 300, 38, 12);
+      ctx.fillStyle = 'rgba(255,179,71,.14)'; ctx.fill();
+    }
+    txt(rows[i], W / 2, y, 17, on ? PAL.amber : 'rgba(232,238,248,.6)', 'center', on ? 800 : 500);
+  }
+  txt('↑↓ 选择 · ←→ 音量 ' + Math.round(prefs.volume * 100) + '% · 回车确认 · Esc 继续',
+    W / 2, 500, 11.5, 'rgba(232,238,248,.34)', 'center', 500);
+}
+
+function pauseRows() {
+  return ['继续', '重新开始这条线', '换一条路（新种子）', '回主菜单', '音量'];
+}
+
+function drawStageCard() {
+  const bg = ctx.createLinearGradient(0, 0, 0, H);
+  bg.addColorStop(0, '#0a1018');
+  bg.addColorStop(1, '#05070c');
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, W, H);
+  const gl = ctx.createRadialGradient(W / 2, 210, 30, W / 2, 210, 430);
+  gl.addColorStop(0, 'rgba(79,224,208,.10)');
+  gl.addColorStop(1, 'rgba(79,224,208,0)');
+  ctx.fillStyle = gl;
+  ctx.fillRect(0, 0, W, H);
+
+  const last = rally.times[rally.times.length - 1];
+  if (!last) return;
+  const cum = rally.times.reduce((a, b) => a + b.total, 0);
+
+  txt('赛 段 ' + rally.times.length + ' / ' + STAGE_COUNT + ' 完 成', W / 2, 120, 26, '#fff', 'center', 800);
+  txt(last.name, W / 2, 148, 13, 'rgba(79,224,208,.8)', 'center', 600);
+
+  txt(fmtTime(last.total), W / 2, 236, 64, PAL.amber, 'center', 800);
+  const d = last.total - last.par;
+  txt(d <= 0 ? '比基准快 ' + (-d).toFixed(1) + 's' : '比基准慢 ' + d.toFixed(1) + 's',
+    W / 2, 266, 13, d <= 0 ? PAL.cyan : PAL.red, 'center', 700);
+
+  const col = (x, label, val, color) => {
+    txt(label, x, 330, 11, 'rgba(232,238,248,.4)', 'center', 600);
+    txt(val, x, 356, 20, color || PAL.text, 'center', 700);
+  };
+  col(W / 2 - 150, '累计', fmtTime(cum), '#fff');
+  col(W / 2, '撞车', last.crashes, last.crashes ? PAL.red : PAL.text);
+  col(W / 2 + 150, '完美换挡', last.perfect + '/' + last.shifts, PAL.cyan);
+
+  txt('下一段 · ' + STAGE_NAMES[stageIdx] + '（' + (stageIdx === 1 ? '雨更大' : '能见度更低') + '）',
+    W / 2, 430, 13, 'rgba(232,238,248,.55)', 'center', 600);
+
+  const blink = 0.6 + 0.4 * Math.sin(gameTime * 3.4);
+  ctx.globalAlpha = blink;
+  txt('空格  进入第 ' + (stageIdx + 1) + ' 段', W / 2, 486, 16, '#fff', 'center', 700);
+  ctx.globalAlpha = 1;
+  txt('Esc  退出拉力', W / 2, 516, 11.5, 'rgba(232,238,248,.3)', 'center', 500);
+}
+
+function drawResult() {
+  ctx.fillStyle = 'rgba(3,5,9,.94)';
+  ctx.fillRect(0, 0, W, H);
+  const r = result;
+  if (!r) return;
+
+  const isRally = !!r.rally;
+  const statsY = isRally ? 366 : 384;
+
+  txt(isRally ? '拉 力 完 赛' : '到 线', W / 2, 96, 40, '#fff', 'center', 800);
+  txt(r.best ? '新纪录！' : '完赛', W / 2, 124, 14, r.best ? PAL.cyan : 'rgba(232,238,248,.45)', 'center', 700);
+
+  txt(fmtTime(r.total), W / 2, 214, 70, PAL.amber, 'center', 800);
+  txt('用时', W / 2, 238, 12, 'rgba(232,238,248,.4)', 'center', 600);
+
+  const stars = '★'.repeat(r.stars) + '☆'.repeat(3 - r.stars);
+  txt(stars, W / 2, 282, 28, r.stars > 0 ? PAL.cyan : 'rgba(232,238,248,.22)', 'center', 700);
+  txt('基准 ' + fmtTime(r.par), W / 2, 304, 11, 'rgba(232,238,248,.32)', 'center', 600);
+
+  const col = (x, label, val, color) => {
+    txt(label, x, statsY, 11, 'rgba(232,238,248,.4)', 'center', 600);
+    txt(val, x, statsY + 26, 21, color || PAL.text, 'center', 700);
+  };
+  col(W / 2 - 190, '撞车', r.crashes, r.crashes ? PAL.red : PAL.text);
+  col(W / 2, '罚时', '+' + r.penalty.toFixed(1) + 's', r.penalty ? PAL.red : PAL.text);
+  col(W / 2 + 190, '鸣笛', r.honks, PAL.cyan);
+
+  /* 拉力：三段明细放在统计下面 */
+  if (isRally && r.stages) {
+    for (let i = 0; i < r.stages.length; i++) {
+      const st = r.stages[i];
+      const x = W / 2 + (i - 1) * 190;
+      txt('赛段' + (i + 1) + ' · ' + st.name, x, statsY + 62, 10, 'rgba(232,238,248,.34)', 'center', 500);
+      txt(fmtTime(st.total), x, statsY + 80, 14, 'rgba(232,238,248,.78)', 'center', 700);
+    }
+  }
+
+  const coopY = isRally ? 502 : 452;
+  txt('换挡 ' + r.shifts + ' 次 · 完美 ' + r.perfect + ' 次 · 副驾刹车 ' + r.brakeTime.toFixed(1) + 's',
+    W / 2, coopY, 11, 'rgba(232,238,248,.34)', 'center', 500);
+  let tip = '';
+  if (r.brakeTime < 0.5) tip = '全程没踩过刹车 —— 发夹弯前让他帮你收速度，比抢挡更稳';
+  else if (r.perfect >= 5 && r.perfect >= r.shifts * 0.5) tip = '换挡时机很准 —— ' + r.perfect + '/' + r.shifts + ' 次踩在完美区';
+  else if (r.perfect === 0 && r.shifts > 0) tip = '换挡全错过了完美区 —— 转速到红区再升，别提前';
+  if (tip && !isRally) {
+    txt(tip, W / 2, coopY + 20, 10.5, 'rgba(255,179,71,.55)', 'center', 500);
+  }
+
+  const best = isRally ? (career.rally[r.diff] || 0) : (career.best[r.diff] || 0);
+  txt((isRally ? '拉力最佳 ' : '本难度最佳 ') + fmtTime(best), W / 2, isRally ? 528 : 496, 11.5,
+    'rgba(232,238,248,.4)', 'center', 600);
+
+  const blink = 0.6 + 0.4 * Math.sin(gameTime * 3.4);
+  ctx.globalAlpha = blink;
+  txt(ghost ? 'R  重跑这条（抓幽灵）· N  换一条 · 空格 回主菜单' : 'R  重跑这条 · N  换一条 · 空格 回主菜单',
+    W / 2, isRally ? 558 : 524, 14, '#fff', 'center', 700);
+  ctx.globalAlpha = 1;
+}
+
+function drawQRs() {
+  ctx.fillStyle = 'rgba(3,5,9,.975)';
+  ctx.fillRect(0, 0, W, H);
+  txt('手机扫码 · 各拿一台', W / 2, 116, 26, '#fff', 'center', 800);
+  txt('电脑当大屏，两台手机连同一 WiFi', W / 2, 148, 12.5, 'rgba(232,238,248,.42)', 'center', 500);
+  const items = [
+    { p: 1, x: 180, label: '司机 · 左', color: PAL.amber },
+    { p: 2, x: 560, label: '领航 · 右', color: PAL.cyan }
+  ];
+  for (const it of items) {
+    const w = drawQR(qrFor(lanPadURL(it.p)), it.x, 180, 220);
+    txt(it.label, it.x + (w || 220) / 2, 428, 15, it.color, 'center', 800);
+    txt(lanPadURL(it.p).replace(/^https?:\/\//, ''), it.x + (w || 220) / 2, 450, 10.5,
+      'rgba(232,238,248,.36)', 'center', 500);
+  }
+  txt('Q / Esc 关闭', W / 2, 540, 12, 'rgba(232,238,248,.3)', 'center', 500);
+}
+
+/* ═══════════════ 19. 键盘 ═══════════════ */
+function onKeyDown(ev) {
+  const code = ev.code || '';
+  if (!actx) AC();
+  keys[code] = 1;
+  if (ev.repeat) return;
+  if (ev.preventDefault) ev.preventDefault();
+
+  if (code === 'KeyM') { muted = !muted; prefs.muted = muted; applyMute(); store('twinDrive.prefs', prefs); return; }
+
+  if (qrOverlay) {
+    if (code === 'KeyQ' || code === 'Escape' || code === 'Enter') { qrOverlay = false; SFX.deny(); }
+    return;
+  }
+
+  if (state === 'menu') {
+    const go = () => {
+      AC();
+      diffName = DIFF_KEYS[menuSel];
+      if (menuMode === 1) startRally(null);
+      else startRun(null, DIFF_KEYS[menuSel]);
+    };
+    if (code === 'ArrowLeft') { menuSel = (menuSel + 2) % 3; SFX.beep(false); }
+    else if (code === 'ArrowRight') { menuSel = (menuSel + 1) % 3; SFX.beep(false); }
+    else if (code === 'ArrowUp' || code === 'ArrowDown' || code === 'KeyS') {
+      menuMode = menuMode === 1 ? 0 : 1;
+      SFX.beep(false);
+    } else if (code === 'Digit1' || code === 'Digit2' || code === 'Digit3') {
+      menuSel = Number(code.slice(5)) - 1;
+      go();
+    } else if (code === 'Space' || code === 'Enter' || code === 'NumpadEnter') {
+      go();
+    } else if (code === 'KeyQ' && LAN) {
+      qrOverlay = true;
+    }
+    return;
+  }
+
+  if (code === 'KeyP' || code === 'Escape') {
+    if (state === 'playing' || state === 'countdown') {
+      prevState = state; state = 'paused'; pauseSel = 0;
+      engineStop();
+    } else if (state === 'paused') {
+      state = prevState || 'playing';
+      if (state === 'playing') engineStart();
+    } else if (state === 'result') {
+      state = 'menu';
+    }
+    return;
+  }
+
+  if (state === 'paused') {
+    if (code === 'ArrowUp') pauseSel = (pauseSel + pauseRows().length - 1) % pauseRows().length;
+    else if (code === 'ArrowDown') pauseSel = (pauseSel + 1) % pauseRows().length;
+    else if (code === 'ArrowLeft') setVolume(prefs.volume - 0.1);
+    else if (code === 'ArrowRight') setVolume(prefs.volume + 0.1);
+    else if (code === 'Enter' || code === 'NumpadEnter' || code === 'Space') pauseActivate();
+    return;
+  }
+
+  if (state === 'stageOver') {
+    if (code === 'Space' || code === 'Enter' || code === 'NumpadEnter') startStage();
+    else if (code === 'Escape') { state = 'menu'; engineStop(); }
+    return;
+  }
+
+  if (state === 'result') {
+    const wasRally = !!(result && result.rally);
+    if (code === 'KeyR') {
+      /* 重跑同一条：种子不变，幽灵车会跟着一起跑 */
+      if (wasRally) startRally(result.seed); else startRun(result ? result.seed : null, diffName);
+    } else if (code === 'KeyN') {
+      if (wasRally) startRally(null); else startRun(null, diffName);
+    } else if (code === 'Space' || code === 'Enter' || code === 'Escape') state = 'menu';
+    return;
+  }
+}
+
+function onKeyUp(ev) { delete keys[ev.code || '']; }
+
+function pauseActivate() {
+  const i = pauseSel;
+  if (i === 0) { state = prevState || 'playing'; if (state === 'playing') engineStart(); }
+  else if (i === 1) { startRun(runSeed, diffName); }
+  else if (i === 2) { startRun(null, diffName); }
+  else if (i === 3) { state = 'menu'; engineStop(); }
+  else if (i === 4) { setVolume(prefs.volume >= 0.99 ? 0.2 : prefs.volume + 0.2); }
+  SFX.beep(false);
+}
+
+/* ═══════════════ 20. 主循环 ═══════════════ */
+let engineAcc = 0;
+let forceAuto = false;
+
+function step(dt) {
+  gameTime += dt;
+  pollPads();
+  if (toastT > 0) toastT -= dt;
+
+  if (state === 'menu') return;
+
+  if (state === 'countdown') {
+    cdT -= dt;
+    const seg = cdT > 1.5 ? 1 : cdT > 0.9 ? 2 : cdT > 0.3 ? 3 : 4;
+    if (seg > beepStep) { beepStep = seg; SFX.beep(seg === 4); }
+    if (cdT <= 0) { state = 'playing'; engineStart(); }
+    return;
+  }
+
+  if (state !== 'playing') return;
+
+  const ctl = (AUTO || forceAuto) ? autopilot(track, car) : readInput();
+  stepCar(dt, ctl);
+  if (state !== 'playing') return;
+
+  updateHazards(dt);
+  updateCamera(dt);
+  stats.time += dt;
+
+  /* 录幽灵：40Hz */
+  if (ghostRec && (++ghostTick % 3 === 0)) {
+    ghostRec.push(Math.round(car.x), Math.round(car.y), Math.round(car.a * 100), Math.round(car.s));
+  }
+  /* 和幽灵比里程 */
+  const gh = ghostAt(stats.time);
+  ghostDelta = gh ? (car.s - gh.s) / 12 : 0;
+  lanTick(dt);
+
+  engineAcc += dt;
+  if (engineAcc > 0.05) { engineAcc = 0; engineTick(car.spd, ctl.gas, true); }
+}
+
+function render() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = PAL.bg;
+  ctx.fillRect(0, 0, W, H);
+
+  if (state === 'menu') { drawMenuScene(); return; }
+
+  if (state === 'result' || state === 'stageOver') {
+    /* 结算/赛段卡不画车外场景，避免终点格纹透上来把数字压花 */
+    const bg = ctx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, '#0a1018');
+    bg.addColorStop(1, '#05070c');
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, 0, W, H);
+    const gl = ctx.createRadialGradient(W / 2, 220, 30, W / 2, 220, 420);
+    gl.addColorStop(0, 'rgba(255,179,71,.10)');
+    gl.addColorStop(1, 'rgba(255,179,71,0)');
+    ctx.fillStyle = gl;
+    ctx.fillRect(0, 0, W, H);
+  } else {
+    drawWorld();
+    drawLights();
+    drawMarks();
+    drawCarBody();
+    drawFlash();
+  }
+
+  if (state === 'playing' || state === 'countdown') {
+    drawProgress();
+    drawPanel();
+    drawSpeed();
+    drawTach();
+    drawToast();
+  }
+  drawGhostEdge();
+
+  if (state === 'countdown') drawCountdown();
+  else if (state === 'paused') drawPause();
+  else if (state === 'result') drawResult();
+  else if (state === 'stageOver') drawStageCard();
+
+  if (qrOverlay) drawQRs();
+}
+
+let lastTs = 0, acc = 0;
+function frame(ts) {
+  requestAnimationFrame(frame);
+  if (!lastTs) lastTs = ts;
+  let dt = (ts - lastTs) / 1000;
+  lastTs = ts;
+  if (!isFinite(dt) || dt < 0) dt = 0;
+  if (dt > 0.25) dt = 0.25;
+  acc += dt;
+  let guard = 0;
+  while (acc >= STEP && guard++ < 12) { step(STEP); acc -= STEP; }
+  if (guard >= 12) acc = 0;
+  render();
+}
+
+/* ═══════════════ 21. 启动 ═══════════════ */
+makeGrassPattern();
+if (typeof addEventListener === 'function') {
+  addEventListener('keydown', onKeyDown);
+  addEventListener('keyup', onKeyUp);
+  addEventListener('blur', () => { for (const k in keys) delete keys[k]; });
+}
+lanInit();
+
+/** ?auto=1&ff=6 —— 无头截图/自测用：直接发车，并先把前半段模拟掉 */
+function autoBoot() {
+  if (!AUTO) return;
+  const wantRally = /[?&]rally/.test(SEARCH);
+  const autoAdvance = /[?&]advance/.test(SEARCH);
+  diffName = AUTO_DIFF;
+  if (wantRally) startRally(AUTO_SEED); else startRun(AUTO_SEED, AUTO_DIFF);
+  forceAuto = true;
+  const m = SEARCH.match(/[?&]ff=([\d.]+)/);
+  const mk = SEARCH.match(/[?&]mark=(\d+)/);
+  if (mk) { setTimeout(() => addMark(Number(mk[1])), 0); addMarkNow = Number(mk[1]); }
+  const ff = m ? Math.min(300, Number(m[1]) || 0) : 0;
+  for (let i = 0; i < ff / STEP; i++) {
+    step(STEP);
+    if (autoAdvance && state === 'stageOver') onKeyDown({ code: 'Space', repeat: false, preventDefault() {} });
+    if (addMarkNow && state === 'playing' && !marks.length) addMark(addMarkNow);
+  }
+  if (/[?&]pause/.test(SEARCH)) onKeyDown({ code: 'KeyP', repeat: false, preventDefault() {} });
+  if (/[?&]qr/.test(SEARCH)) { qrOverlay = true; }
+}
+
+autoBoot();
+requestAnimationFrame(frame);
+
+/* ═══════════════ 22. 测试钩子 ═══════════════ */
+window.__twinDrive = {
+  STEP, W, H, CFG, DIFFS, DIFF_KEYS, PAL,
+  get state() { return state; },
+  get prevState() { return prevState; },
+  get track() { return track; },
+  get car() { return car; },
+  get stats() { return stats; },
+  get cows() { return cows; },
+  get cans() { return cans; },
+  get rocks() { return rocks; },
+  get zones() { return zones; },
+  get parts() { return parts; },
+  get result() { return result; },
+  get diff() { return diffName; },
+  get menuSel() { return menuSel; },
+  get menuMode() { return menuMode; },
+  get runMode() { return runMode; },
+  get stageIdx() { return stageIdx; },
+  get rallyTimes() { return rally.times; },
+  get ghost() { return ghost; },
+  get ghostDelta() { return ghostDelta; },
+  get marks() { return marks; },
+  addMark,
+  get pauseSel() { return pauseSel; },
+  get volume() { return prefs.volume; },
+  get lan() { return lan; },
+  startRun, startRally, startStage, genTrack, sampleAt, nearestOnTrack, autopilot, readInput, pauseRows,
+  safeSpeed, curvatureAt, turnFactor,
+  fmtTime, meters, kmh, idxAtS,
+  setAuto(v) { forceAuto = !!v; },
+  setNaive(v) { naiveMode = !!v; },
+  setSolo(v) { soloMode = !!v; },
+  press(code) { onKeyDown({ code, repeat: false, preventDefault() {} }); },
+  release(code) { onKeyUp({ code }); },
+  tap(code) { onKeyDown({ code, repeat: false, preventDefault() {} }); onKeyUp({ code }); },
+  probe(seed, dname) {
+    const tr = genTrack(seed, dname);
+    let maxSlope = 0, minHalf = 1e9, maxHalf = 0, mono = true, maxGap = 0;
+    for (let i = 0; i < tr.pts.length; i++) {
+      if (i > 0) {
+        const dy = tr.pts[i].y - tr.pts[i - 1].y;
+        if (dy >= 0) mono = false;
+        const dx = Math.abs(tr.pts[i].x - tr.pts[i - 1].x);
+        maxSlope = Math.max(maxSlope, dx / tr.seg);
+        maxGap = Math.max(maxGap, Math.hypot(dx, dy));
+      }
+      minHalf = Math.min(minHalf, tr.half[i]);
+      maxHalf = Math.max(maxHalf, tr.half[i]);
+    }
+    return {
+      total: tr.total, n: tr.pts.length, maxSlope, minHalf, maxHalf, mono, maxGap,
+      cows: tr.cows.length, cans: tr.cans.length, haz: tr.haz.length,
+      rocks: tr.zones.filter((z) => z.kind === 'rock').length
+    };
+  }
+};
+})();
+</script>
+</body>
+</html>
