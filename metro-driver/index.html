@@ -241,21 +241,25 @@ const MetroModel = (() => {
     'md.word.上': '認「上」', 'md.word.九': '認「九」'
   };
 
-  // 狀態判定：跟雙層巴士 shell.js 的 gateStateOf 同一套讀法（dd 是 mastery 投影，這裡直接看富記錄）。
-  // 四種值：自己會 / 教過一次 / 未考（'未識' 不在此列——答錯的人在 dd 的口徑下就是「教過一次」，
-  // 不是「未識」；保留這個詞只是怕下游先前按字串寫死過，本函數永遠不會回它）。
+  // 狀態判定：四檔，由上而下判，冇任何兜底成「自己會」的分支（QA F-1）：
+  //   1. 完全冇紀錄（seen/f/w/res 全 0）            → 未考（一次都冇考過）
+  //   2. mastered（streak>=2 && f>=2 && seen>=3）  → 自己會（真係穩陣）
+  //   3. !mastered && (res > 0 || w > 0)           → 教過一次（答錯過 / 靠提示過關）
+  //   4. 其餘（f > 0、冇答錯、冇救援，但次數未夠）  → 做對過（答對過，仲未夠穩）
+  // 第 4 檔一定要獨立：{seen:1,f:1} 只答對過一次，唔可以寫「自己會」令家長以為已經學會。
+  // 第 1 檔要連 w/res 一齊睇：seen 只由開閘 +1，站內答錯不加 seen，所以答錯過的人
+  // 係 {seen:0,w:1}，要落到第 3 檔「教過一次」，唔可以當未考。
   function kpState(rec) {
     const r = rec || {};
     const seen = Number(r.seen) || 0, f = Number(r.f) || 0, w = Number(r.w) || 0, res = Number(r.res) || 0;
-    const learned = !!r.mastered;
-    if (learned) return '自己會';                          // 1. 三條 mastered 判據齊 → 自己會
-    if (res > 0 || (w > 0 && !learned)) return '教過一次';   // 2. 被救援過 / 答錯過 → 教過一次
-    if (seen === 0) return '未考';                          // 3. 一次都冇開過閘 → 未考
-    // 4. 其餘邊界：考過、也自己答對過（f > 0），但未夠 mastered 的三條（例如 seen < 3 或 streak 斷過）。
-    //    跟 dd 一樣投影成「自己會」——家長要知他「識答」；是否已學會另有判據，
-    //    面板同時列出「自己答對」次數，所以達不到 3 次的會一眼看到次數不夠。
-    //    （seen 只由開閘 +1，站內答錯不加 seen，所以站內答錯會落在第 2 步，不會被誤判成未考。）
-    return '自己會';
+    // mastered 判據跟 shared/knowledge-gate.js 的 mastered() 一致；記錄上沒有這個欄位時自己算，
+    // 這樣手寫的存檔（例如 QA 只造 seen/f/streak）也會得到同一個答案。
+    const mastered = !!r.mastered || ((Number(r.streak) || 0) >= 2 && f >= 2 && seen >= 3);
+    if (seen === 0 && f === 0 && w === 0 && res === 0) return '未考';
+    if (mastered) return '自己會';
+    if (res > 0 || w > 0) return '教過一次';
+    if (f > 0) return '做對過';
+    return '未考';      // 有 seen 但一個答案都冇結算（開咗閘就走）：冇證據就當未考，無論如何唔會變「自己會」
   }
 
   // m.report() → 家長面板的兩張表要用的資料（13 條知識點 + 5 條線）。見 docs/knowledge-gate-product.md §7.3
@@ -2088,16 +2092,19 @@ const MetroRender = (() => {
     placeParent();
   }
 
-  // 家長圖示貼在畫布右上角、靜音鍵下面（邏輯座標 1222,132）：
-  //   · 靜音鍵 (1225,50) r32 的熱區半徑 46，圖示上緣離它 56px，兩個長按／短按不會互相偷；
+  // 家長圖示貼在畫布右上角、靜音鍵下面（邏輯座標 1222,150）：
+  //   · 靜音鍵 (1225,50) r32 的觸控熱區半徑 46。圖示 CSS 尺寸有 44px 下限，所以縮放越細、它佔的
+  //     邏輯面積越大：1280×720 與靜音鍵隔 32px、1024×768 隔 26.5px、800×600 隔 18.8px、
+  //     844×390（手機橫屏）隔 13.4px——全部不相交。原本 y=132 在手機橫屏會相交，所以往下移了
+  //     18 個邏輯 px（往上／往左只會更貼靜音鍵，兩者中間沒有別的空白位）。
   //   · kids-time 的時長徽章是 DOM 釘在畫面「頂正中」，這裡貼右邊，而且它的長按只在徽章本身上，
-  //     兩者在任何視窗比例下都隔得開（1280 寬時相距 ~430px，800 寬時仍有 ~360px）；
+  //     兩者在任何視窗比例下都隔得開（1280 寬時相距 ~490px，800 寬時仍有 ~300px）；
   //   · 右下角被主按鈕 (1140,585) r95 的白色光環佔住、而且貼住畫面底部會被裁，
   //     右上角在遊玩、選線兩頁都是空白（太陽在 x≈1080，線卡最高到 y=270，路線條到 x=1000）。
   function placeParent() {
     const r = cv.getBoundingClientRect();
-    const d = Math.max(34, 48 * scale);
-    const cx = r.left + 1222 * scale, cy = r.top + 132 * scale;
+    const d = Math.max(44, 48 * scale);
+    const cx = r.left + 1222 * scale, cy = r.top + 150 * scale;
     openBtn.style.width = d + 'px'; openBtn.style.height = d + 'px';
     openBtn.style.left = (cx - d / 2) + 'px'; openBtn.style.top = (cy - d / 2) + 'px';
   }
@@ -2128,7 +2135,8 @@ const MetroRender = (() => {
     const lineRows = r.lines.map(l => '<tr><td>' + esc(l.name) + '</td><td>' +
       (l.stars ? '★'.repeat(l.stars) + '☆'.repeat(4 - l.stars) : '—') + ' ' + l.stars + ' / 4</td></tr>').join('');
     panel.innerHTML = '<div class="box"><h2>家長面板</h2>' +
-      '<p>答錯多嘅知識點排最前，未考過嘅都會列出；「教過一次」＝嗰次靠提示過關，「自己會」＝第一次就答中。' +
+      '<p>答錯多嘅知識點排最前，未考過嘅都會列出。狀態：未考＝仲未考過；做對過＝自己答對過但未夠穩；' +
+      '教過一次＝答錯過或者靠提示過關；自己會＝連續答對、至少考過三次。' +
       '星星係每條線最高嗰次（最多 4 粒）。</p>' +
       '<div class="tables">' +
       '<table class="kps"><tr><th>知識點</th><th>自己答對</th><th>教過</th><th>答錯</th><th>狀態</th></tr>' + rows + '</table>' +
