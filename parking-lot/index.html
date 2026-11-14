@@ -29,17 +29,38 @@ body.portrait #rotate { display: flex; }
 }
 #parent[hidden] { display: none; }
 #parent .box {
-  background: #fff; border-radius: 20px; padding: 20px 26px; max-width: 640px; width: 86%;
+  background: #fff; border-radius: 20px; padding: 18px 26px; max-width: 900px; width: 86%;
   max-height: 86%; overflow: auto; color: #2b323b;
 }
 #parent h2 { margin: 0 0 6px; }
 #parent p { margin: 0 0 12px; font-size: 14px; color: #5b6470; }
 #parent table { width: 100%; border-collapse: collapse; font-size: 15px; }
 #parent th, #parent td { padding: 6px 8px; border-bottom: 1px solid #e3e6ea; text-align: left; }
+/* 兩張統計表並排：1280×720 一屏睇完，窄屏（<720）疊返上下一列 */
+#parent .tables { display: flex; gap: 22px; align-items: flex-start; }
+#parent .tables .col { flex: 1 1 0; min-width: 0; }
+#parent .tables .col.side { flex: 0 0 236px; }
+@media (max-width: 720px) {
+  #parent .tables { display: block; }
+  #parent .tables .col.side { margin-top: 16px; }
+}
 #parent button {
   margin-top: 14px; padding: 10px 26px; border: 0; border-radius: 12px;
   background: #00a59b; color: #fff; font-size: 16px; font-weight: 700;
 }
+/* 知識點 / 每個字母表格：同另外三款一致（表頭淺灰底、數字置中、一行行幼線） */
+#parent .sec { margin: 18px 0 6px; font-size: 17px; }
+#parent .sec.first { margin-top: 10px; }
+#parent .sec.last { margin-top: 26px; }
+#parent .tables .col > .sec:first-child { margin-top: 0; }
+#parent table.kps, #parent table.stats { font-size: 14px; }
+#parent table.kps th, #parent table.kps td,
+#parent table.stats th, #parent table.stats td { padding: 4px 8px; }
+#parent table.kps th, #parent table.stats th { font-weight: 700; color: #46505d; background: #f4f6f8; }
+#parent table.kps td:not(:first-child) { text-align: center; }
+#parent table.stats td:last-child { text-align: center; }
+#parent button:focus-visible { outline: 3px solid #f0a51a; outline-offset: 3px; }
+
 
 </style>
 </head>
@@ -135,6 +156,10 @@ const ParkModel = (() => {
   const KPS = { 'pl.dot.count': spotQ, 'pl.money.count': moneyQ };
   LETTERS.forEach(L => { KPS['pl.letter.' + L] = env => letterQ(env, L); });
   NUMS.forEach(n => { KPS['pl.num.' + n] = env => numQ(env, n); });
+  // 家长面板用的名称（只有大人会见到，游戏画面照旧一个字都唔出现）
+  const KP_LABEL = { 'pl.dot.count': '數車位圓點', 'pl.money.count': '數銀仔' };
+  LETTERS.forEach(L => { KP_LABEL['pl.letter.' + L] = '字母 ' + L; });
+  NUMS.forEach(n => { KP_LABEL['pl.num.' + n] = '號碼 ' + n; });
   // 每关出口考边一族（键 = LEVELS[level].key）；同一族里按 R2 挑一个（答错过的先补考，同一日唔连考）
   const LEVEL_KPS = {
     num: ['pl.dot.count'],
@@ -142,6 +167,43 @@ const ParkModel = (() => {
     read: NUMS.map(n => 'pl.num.' + n),
     pay: ['pl.money.count']
   };
+
+  // ───────── 家長面板的資料組裝（純函數：只讀 m，唔寫 m、唔碰 DOM / localStorage）─────────
+  // 狀態判定：四檔，由上而下判，冇任何兜底成「自己會」的分支（同 metro-driver 一字不差）：
+  //   1. 完全冇紀錄（seen/f/w/res 全 0）            → 未考（一次都冇考過）
+  //   2. mastered（streak>=2 && f>=2 && seen>=3）  → 自己會（真係穩陣）
+  //   3. !mastered && (res > 0 || w > 0)           → 教過一次（答錯過 / 靠提示過關）
+  //   4. 其餘（f > 0、冇答錯、冇救援、次數未夠）    → 做對過（答對過，仲未夠穩）
+  // 第 4 檔一定要獨立：{seen:1,f:1} 只答對過一次，唔可以寫「自己會」令家長以為已經學會。
+  // 第 1 檔要連 w/res 一齊睇：seen 只由開閘 +1，所以「答錯過但未考到」嘅記錄要落到第 3 檔。
+  function kpState(rec) {
+    const r = rec || {};
+    const seen = Number(r.seen) || 0, f = Number(r.f) || 0, w = Number(r.w) || 0, res = Number(r.res) || 0;
+    // mastered 判據跟 shared/knowledge-gate.js 的 mastered() 一致；記錄上冇這個欄位時自己算，
+    // 咁手寫嘅存檔（例如 QA 只造 seen/f/streak）都會得到同一個答案。
+    const mastered = !!r.mastered || ((Number(r.streak) || 0) >= 2 && f >= 2 && seen >= 3);
+    if (seen === 0 && f === 0 && w === 0 && res === 0) return '未考';
+    if (mastered) return '自己會';
+    if (res > 0 || w > 0) return '教過一次';
+    if (f > 0) return '做對過';
+    return '未考';      // 有 seen 但一個答案都冇結算（開咗閘就走）：冇證據就當未考，無論如何唔會變「自己會」
+  }
+
+  // m.report() → 家長面板「知識點」表要用的資料。15 條全部列出（未考過嘅都要有）。
+  // m 收 model 實例（api）或者內部狀態都可以，只讀 gateState().kb，唔會改任何嘢。
+  function report(m) {
+    const st = m && typeof m.gateState === 'function' ? m.gateState()
+      : (m && m.kg && typeof m.kg.state === 'function') ? m.kg.state() : null;
+    const kb = (st && st.kb) || {};
+    const rows = Object.keys(KPS).map((id, i) => {
+      const r = kb[id] || {};
+      return { i, row: { id, label: KP_LABEL[id] || id,
+        f: Number(r.f) || 0, w: Number(r.w) || 0, res: Number(r.res) || 0, state: kpState(r) } };
+    });
+    // 家長要先睇到弱項：答錯多 → 答對多 → 知識點表本身嘅固定順序；未考過嘅自然排到尾
+    rows.sort((a, b) => (b.row.w - a.row.w) || (b.row.f - a.row.f) || (a.i - b.i));
+    return { kps: rows.map(x => x.row) };
+  }
 
   function create(rng) {
     rng = rng || Math.random;
@@ -460,13 +522,15 @@ const ParkModel = (() => {
       gate: () => (m.phase === 'gate' ? kg.view() : null),
       gateAnswer: answerGate,
       gateState: () => kg.state(),
-      mastery: () => kg.state().mastery          // { kpId: [自己答对次数, 认错次数] }
+      mastery: () => kg.state().mastery,         // { kpId: [自己答对次数, 认错次数] }
+      // 家长面板：资料组装住在 model（可单测），面板只负责画表
+      report: () => report(api)
     };
     return api;
   }
 
   return {
-    create, LEVELS, LIVERIES, LETTERS, T, need, KPS, LEVEL_KPS, canSelect,
+    create, report, kpState, KP_LABEL, LEVELS, LIVERIES, LETTERS, T, need, KPS, LEVEL_KPS, canSelect,
     STAGES: () => KG().STAGES, mastered: rec => KG().mastered(rec)
   };
 })();
@@ -1902,7 +1966,13 @@ const ParkRender = (() => {
   cv.addEventListener('contextmenu', e => e.preventDefault());
 
   window.addEventListener('keydown', e => {
-    if (e.repeat || paused || !panel.hidden || clock.blocked || clock.dialogOpen) return;
+    if (e.repeat) return;
+    // 面板開住：Esc 關返（鍵盤用戶唔使摸去撳掣），其餘按鍵一律唔入遊戲（面板開住時遊戲係暫停嘅）
+    if (!panel.hidden) {
+      if (e.code === 'Escape') { e.preventDefault(); closeParent(); }
+      return;
+    }
+    if (paused || clock.blocked || clock.dialogOpen) return;
     ParkAudio.unlock();
     const m = g.m;
     if (e.code === 'Space' || e.code === 'Enter') {
@@ -1926,6 +1996,7 @@ const ParkRender = (() => {
   });
 
   const esc = s => String(s).replace(/[&<>]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[ch]);
+  // 面板只讀 g.report()（資料組裝在 model，可單測），這裡只管排版
   function showParent() {
     if (clock.blocked || clock.dialogOpen) return;
     const names = ParkRender.LEVEL_NAME;
@@ -1939,14 +2010,37 @@ const ParkRender = (() => {
     const st = g.m.stats;
     const statRows = Object.keys(st).filter(k => /^[LNP]_/.test(k)).sort((a, b) => st[b][1] - st[a][1] || a.localeCompare(b))
       .map(k => '<tr><td>' + esc(label(k)) + '</td><td>' + st[k][0] + '</td><td>' + st[k][1] + '</td></tr>').join('');
-    panel.innerHTML = '<div class="box"><h2>家長記錄</h2>' +
-      '<p>認錯號碼 = 泊咗去另一個號碼；認錯字母 = 號碼啱但係行唔啱。畀錯錢 = 銀仔數唔啱就撳開閘。等太耐冇動，第二次提示會閃出車位，嗰架車唔計星。難度 1–3：成關冇錯，下次車位多啲、號碼大啲、圓點會收起。</p>' +
+    // 知識點（出口閘門）15 條全列，答錯多嘅排最前；同「每個字母 / 號碼」係兩件事
+    const kpRows = g.report().kps.map(k => '<tr><td>' + esc(k.label) + '</td><td>' + k.f + '</td><td>' + k.res +
+      '</td><td>' + k.w + '</td><td>' + esc(k.state) + '</td></tr>').join('');
+    panel.innerHTML = '<div class="box" role="dialog" aria-modal="true" aria-label="家長記錄"><h2>家長記錄</h2>' +
+      '<h2 class="sec first">知識點（每關出口嘅閘門）</h2>' +
+      '<p>答啱閘題先放行，答錯會一級一級咁教（灰卡 → 兩張放大 → 只剩一張）。狀態：未考＝一次都未考過；' +
+      '做對過＝自己答對過但仲未夠穩；教過一次＝答錯過，或者要靠提示至答得出；自己會＝至少考過三次、連續兩次自己答對。' +
+      '答錯多嘅排最前，未考過嘅排最後。呢張只計閘門，同右邊「每個字母 / 號碼」（玩法入面嘅對錯）分開。</p>' +
+      '<div class="tables">' +
+      '<div class="col"><table class="kps"><tr><th>知識點</th><th>自己答對</th><th>教過</th><th>答錯</th><th>狀態</th></tr>' + kpRows + '</table></div>' +
+      '<div class="col side"><h2 class="sec">每個字母 / 號碼</h2>' +
+      '<p>呢張只計玩法入面嘅對錯，同左邊嘅閘門分開儲：認錯號碼＝泊咗去另一個號碼；認錯字母＝號碼啱但係行唔啱；畀錯錢＝銀仔數唔啱就撳開閘。錯得多嘅排前面，可以喺日常多指俾佢睇。</p>' +
+      (statRows ? '<table class="stats"><tr><th>項目</th><th>啱</th><th>錯</th></tr>' + statRows + '</table>'
+        : '<p>未有統計，玩過就會有。</p>') +
+      '</div></div>' +
+      '<h2 class="sec last">最近記錄</h2>' +
+      '<p>每次玩完一關嘅星數同對錯；「難度」1–3 會自己調：成關冇錯下次車位多啲、號碼大啲、圓點會收起。</p>' +
       (rows ? '<table><tr><th>時間</th><th>關卡</th><th>星</th><th>認錯號碼</th><th>認錯字母</th><th>畀錯錢</th><th>難度</th></tr>' + rows + '</table>'
         : '<p>未有記錄，玩完一關就會有。</p>') +
-      (statRows ? '<h2 style="margin-top:16px">每個字母 / 號碼</h2><p>錯得多嘅排前面，可以喺日常多指俾佢睇（車牌、車位、𨋢掣）。</p><table><tr><th>項目</th><th>啱</th><th>錯</th></tr>' + statRows + '</table>' : '') +
       '<button id="parentClose">關閉</button></div>';
     panel.hidden = false;
-    document.getElementById('parentClose').onclick = () => { panel.hidden = true; };
+    last = 0;                                   // 下一幀重新計時：唔會因為面板開咗幾耐而爆一大步
+    const close = document.getElementById('parentClose');
+    close.onclick = closeParent;
+    const box = panel.firstChild;
+    if (box) box.scrollTop = 0;                 // 兩張表砌好先由上而家睇起
+    close.focus({ preventScroll: true });       // 鍵盤：焦點落在關閉鍵，Enter 就閂得返
+  }
+  function closeParent() {
+    panel.hidden = true;
+    last = 0;
   }
 
   function frame(now) {
