@@ -11,10 +11,26 @@
   #stage{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;}
   canvas{display:block;border-radius:14px;touch-action:none;
     box-shadow:0 0 0 1px #151c28, 0 24px 70px -20px rgba(0,0,0,.95), 0 0 140px -50px rgba(255,179,71,.35);}
+  /* 触屏键栏：只在触屏设备出现，占画面下方一条，不盖住赛道 */
+  body.touch #stage{bottom:var(--bar,0px);}
+  #touch{position:fixed;left:0;right:0;bottom:0;height:var(--bar,0px);display:none;
+    padding:6px max(10px,env(safe-area-inset-right)) max(8px,env(safe-area-inset-bottom)) max(10px,env(safe-area-inset-left));
+    box-sizing:border-box;justify-content:space-between;align-items:stretch;gap:10px;}
+  body.touch #touch{display:flex;}
+  #touch .side{display:flex;gap:8px;align-items:stretch;}
+  #touch .mid{display:flex;gap:8px;align-items:stretch;justify-content:center;flex:1;}
+  #touch button{font:inherit;font-size:17px;font-weight:800;color:#e8eef8;border-radius:14px;border:1.5px solid #2a3446;
+    background:#111827;min-width:76px;padding:0 14px;touch-action:none;-webkit-touch-callout:none;}
+  #touch button.p1{border-color:#ffb347;color:#ffcf8a;}
+  #touch button.p2{border-color:#4fd1e8;color:#9fe8f5;}
+  #touch button.big{min-width:120px;font-size:20px;}
+  #touch button.on{background:#263247;transform:scale(.97);}
+  #touch [hidden]{display:none !important;}
 </style>
 </head>
 <body>
 <div id="stage"><canvas id="cv"></canvas></div>
+<div id="touch"></div>
 <script>
 (function () {
 'use strict';
@@ -26,9 +42,13 @@ const ctx = cv.getContext('2d');
 const DPR = Math.min(2, (typeof window !== 'undefined' && window.devicePixelRatio) || 1);
 cv.width = W * DPR; cv.height = H * DPR;
 
+const TOUCH = typeof navigator !== 'undefined' && navigator.maxTouchPoints > 0 &&
+  typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches;
 function fit() {
   const pad = 22;
-  const s = Math.min((innerWidth - pad) / W, (innerHeight - pad) / H);
+  const bar = TOUCH ? Math.round(Math.max(96, Math.min(130, innerHeight * 0.16))) : 0;
+  if (TOUCH) { document.body.classList.add('touch'); document.body.style.setProperty('--bar', bar + 'px'); }
+  const s = Math.min((innerWidth - pad) / W, (innerHeight - bar - pad) / H);
   cv.style.width = Math.round(W * s) + 'px';
   cv.style.height = Math.round(H * s) + 'px';
 }
@@ -2974,6 +2994,71 @@ function onKeyDown(ev) {
 
 function onKeyUp(ev) { delete keys[ev.code || '']; }
 
+/* ═══════════════ 19b. 触屏（iPad 两人同屏） ═══════════════
+ * 按钮 = 虚拟按键：按下走 onKeyDown、松开走 onKeyUp，菜单/暂停/结算全部沿用键盘逻辑。
+ * 座位分工照键盘：左边司机（转向 + 油门），右边领航（降档 / 刹车 / 升档 / 鸣笛）。 */
+const TOUCH_LAYOUT = {
+  drive: [
+    [['◀', 'KeyA', 'p1 big'], ['▶', 'KeyD', 'p1 big'], ['油门', 'KeyW', 'p1 big']],
+    [['暂停', 'KeyP', '']],
+    [['降档', 'ArrowDown', 'p2'], ['刹车', 'Space', 'p2 big'], ['升档', 'ArrowUp', 'p2 big'], ['鸣笛', 'KeyL', 'p2']]
+  ],
+  menu: [
+    [['◀ 难度', 'ArrowLeft', ''], ['难度 ▶', 'ArrowRight', '']],
+    [['发车', 'Space', 'p1 big']],
+    [['单段 / 拉力', 'KeyS', ''], ['静音', 'KeyM', '']]
+  ],
+  paused: [
+    [['▲', 'ArrowUp', ''], ['▼', 'ArrowDown', '']],
+    [['确认', 'Enter', 'p1 big']],
+    [['音量 −', 'ArrowLeft', ''], ['音量 +', 'ArrowRight', ''], ['继续', 'KeyP', 'p2']]
+  ],
+  stageOver: [[['退出拉力', 'Escape', '']], [['下一段', 'Space', 'p1 big']], []],
+  result: [[['主菜单', 'Space', '']], [['重跑这条', 'KeyR', 'p1 big']], [['换新赛道', 'KeyN', 'p2 big']]]
+};
+let touchShown = '';
+function touchGroup() {
+  if (state === 'countdown' || state === 'playing') return 'drive';
+  return TOUCH_LAYOUT[state] ? state : 'menu';
+}
+function touchSync() {
+  if (!TOUCH) return;
+  const g = touchGroup();
+  if (g === touchShown) return;
+  touchShown = g;
+  /* 换画面时松开所有虚拟键，免得上一屏按住的键带进下一屏 */
+  for (const k in keys) delete keys[k];
+  const bar = document.getElementById('touch');
+  bar.innerHTML = '';
+  TOUCH_LAYOUT[g].forEach((grp, i) => {
+    const box = document.createElement('div');
+    box.className = i === 1 ? 'mid' : 'side';
+    for (const [label, code, cls] of grp) {
+      const b = document.createElement('button');
+      b.textContent = label; b.className = cls;
+      const held = new Set();
+      const up = (e) => {
+        if (!held.has(e.pointerId)) return;
+        held.delete(e.pointerId);
+        if (!held.size) { b.classList.remove('on'); onKeyUp({ code }); }
+      };
+      b.addEventListener('pointerdown', (e) => {
+        e.preventDefault();
+        try { b.setPointerCapture(e.pointerId); } catch (err) { /* 老 Safari 没有也照样用 */ }
+        held.add(e.pointerId);
+        if (held.size > 1) return;
+        b.classList.add('on');
+        onKeyDown({ code, repeat: false, preventDefault() {} });
+      });
+      b.addEventListener('pointerup', up);
+      b.addEventListener('pointercancel', up);
+      b.addEventListener('contextmenu', (e) => e.preventDefault());
+      box.appendChild(b);
+    }
+    bar.appendChild(box);
+  });
+}
+
 function pauseActivate() {
   const i = pauseSel;
   if (i === 0) { state = prevState || 'playing'; if (state === 'playing') engineStart(); }
@@ -3085,6 +3170,7 @@ function frame(ts) {
   while (acc >= STEP && guard++ < 12) { step(STEP); acc -= STEP; }
   if (guard >= 12) acc = 0;
   render();
+  touchSync();
 }
 
 /* ═══════════════ 21. 启动 ═══════════════ */
